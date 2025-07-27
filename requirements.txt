@@ -4,8 +4,9 @@ TgCrypto
 pyromod==1.5
 schedule
 APscheduler
+psutil
 # --- For-Database ------------ #
-pymongo
+pymongo==4.11.1
 motor
 dnspython
 # --- For-Web-Response ------- #
@@ -13,8 +14,11 @@ aiohttp
 python-dotenv
 # --- For-Web-Response ------- #
 pytz
+aiofiles==24.1.0
 requests
 bs4
 aiofiles
+pillow==10.4.0
 asyncio
 fuzzywuzzy
+Pyrogram==2.0.80
