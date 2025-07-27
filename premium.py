@@ -31,23 +31,23 @@ class Premium:
             'premium': {
                 'name': 'Premium',
                 'levels': {
-                    '7d': {'days': 7, 'price': 5},
-                    '1M': {'days': 30, 'price': 15},
-                    '3M': {'days': 90, 'price': 40},
-                    '6M': {'days': 180, 'price': 70},
-                    '1y': {'days': 365, 'price': 120},
-                    '0': {'days': 9999, 'price': 200, 'name': 'Lifetime'}
+                    '7d': {'days': 7, 'price': 40},
+                    '1M': {'days': 30, 'price': 120},
+               #     '3M': {'days': 90, 'price': 40},
+               #     '6M': {'days': 180, 'price': 70},
+              #      '1y': {'days': 365, 'price': 120},
+             #       '0': {'days': 9999, 'price': 200, 'name': 'Lifetime'}
                 }
             },
             'hpremium': {
                 'name': 'H-Premium',
                 'levels': {
-                    '7d': {'days': 7, 'price': 10},
-                    '1M': {'days': 30, 'price': 25},
-                    '3M': {'days': 90, 'price': 60},
-                    '6M': {'days': 180, 'price': 100},
-                    '1y': {'days': 365, 'price': 180},
-                    '0': {'days': 9999, 'price': 300, 'name': 'Lifetime'}
+                    '7d': {'days': 7, 'price': 90},
+                    '1M': {'days': 30, 'price': 250},
+               #     '3M': {'days': 90, 'price': 60},
+                #    '6M': {'days': 180, 'price': 100},
+               #     '1y': {'days': 365, 'price': 180},
+              #      '0': {'days': 9999, 'price': 300, 'name': 'Lifetime'}
                 }
             }
         }
@@ -521,12 +521,12 @@ class Premium:
         message = "💎 *Premium Plans*\n\n"
         message += "🔹 *Premium Features:*\n"
         message += "- Unlimited downloads\n"
-        message += "- One-click download for all \n available content\n"
+        message += "- One-click download for all \n"
 
         message += "- Priority support\n\n"
         message += "🔞 *H-Premium Features:*\n"
         message += "- All Premium features\n"
-        message += "- Access to adult content\n\n"
+        message += "- Access to H@ntai/A content\n\n"
         message += "Select a plan to view details:"
         
         keyboard = InlineKeyboardMarkup([
@@ -559,23 +559,21 @@ class Premium:
         
         if plan_type == 'premium':
             message += "✅ Unlimited downloads\n"
-            message += "✅ HD quality (720p-1080p)\n"
-            message += "✅ No ads\n"
+            message += "✅ No limits\n"
             message += "✅ Priority support\n"
             message += "✅ Early access to new features\n"
         else:
             message += "🔞 Includes all Premium benefits PLUS:\n"
             message += "✅ Access to adult content\n"
-            message += "✅ Highest quality (1080p-4K)\n"
             message += "✅ Exclusive content\n"
         
         message += "\n💵 *Pricing:*\n"
         for duration, details in plan['levels'].items():
-            message += f"- {details.get('name', duration)}: ${details['price']}\n"
+            message += f"- {details.get('name', duration)}: ₹{details['price']}\n"
         
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("💳 Purchase Now", callback_data=f"purchase_{plan_type}")],
-            [self.get_back_button("premium")]
+            [InlineKeyboardButton("❌ Close", callback_data="close_message")]
         ])
         
         await self.bot.update_message(
@@ -593,8 +591,6 @@ class Premium:
             "Currently premium can only be granted by admins. Contact @admin for details.\n\n"
             "🔹 *What payment methods are accepted?*\n"
             "We accept PayPal, cryptocurrency, and other payment methods.\n\n"
-            "🔹 *Can I get a refund?*\n"
-            "Refunds are available within 7 days of purchase if you're unsatisfied.\n\n"
             "🔹 *How do I check my premium status?*\n"
             "Use /myplan command to see your current subscription details.\n\n"
             "🔹 *What's the difference between Premium and H-Premium?*\n"
@@ -664,46 +660,84 @@ class Premium:
         else:
             await self.show_premium_stats(client, callback_query)
 
+
     async def show_my_plan(self, client: Client, message: Message):
         """Show user their current premium status"""
-        user_status = await self.get_user_status(message.from_user.id)
-        
+        user_id = message.from_user.id
+        user_status = await self.get_user_status(user_id)
+
+        # Fetch user's download info
+        user = await self.db.users_collection.find_one({"user_id": user_id}) or {}
+        today = datetime.now().date().isoformat()
+
+        # Reset if it's a new day (optional safeguard)
+        if user.get("last_download_date") != today:
+            await self.db.users_collection.update_one(
+                {"user_id": user_id},
+                {"$set": {"download_count": 0, "last_download_date": today}},
+                upsert=True
+            )
+            download_count = 0
+        else:
+            download_count = user.get("download_count", 0)
+
+        # Determine user access level and max downloads
+        if user_status['is_premium']:
+            premium_user = await self.db.premium_users.find_one({"user_id": user_id})
+            plan_type = premium_user.get("plan_type") if premium_user else "unknown"
+            access_level = 2 if plan_type == "hpremium" else 1
+        else:
+            access_level = 0
+
+        max_downloads = self.config.MAX_DAILY_DOWNLOADS.get(access_level, 24)
+
+        # Non-premium users
         if not user_status['is_premium']:
+            # Calculate reset time
+            reset_time = datetime.combine(
+                datetime.now().date() + timedelta(days=1),
+                datetime.min.time()
+            )
+            time_left = reset_time - datetime.now()
+            hours = time_left.seconds // 3600
+            minutes = (time_left.seconds % 3600) // 60
+
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("💎 Get Premium", callback_data="premium_plans")],
                 [InlineKeyboardButton("❌ Close", callback_data="close_message")]
             ])
-            
-            await message.reply_text(
+
+            msg = (
                 "🔓 *You don't have an active premium subscription*\n\n"
-                "Upgrade to premium for unlimited downloads and exclusive features!",
-                reply_markup=keyboard
+                f"📥 *Today's Downloads:* `{download_count}/{max_downloads}`\n"
+                f"⏳ *Resets in:* `{hours}h {minutes}m`\n\n"
+                "Upgrade to premium for unlimited downloads and exclusive features!"
             )
+
+            await message.reply_text(msg, reply_markup=keyboard)
             return
-            
-        # User has premium
+
+        # Premium users
         expiry_date = user_status['expiry_date'].strftime("%Y-%m-%d")
         days_left = (user_status['expiry_date'] - datetime.now()).days
-        
-        message_text = (
+
+        msg = (
             f"🌟 *Your {user_status['plan_name']} Subscription*\n\n"
             f"🔹 Status: ✅ Active\n"
             f"🔹 Expiry Date: {expiry_date}\n"
-            f"🔹 Days Remaining: {days_left}\n\n"
+            f"🔹 Days Remaining: {days_left}\n"
+            f"📥 Unlimited daily downloads\n\n"
         )
-        
+
         if days_left < 7:
-            message_text += "⚠️ Your subscription is expiring soon! Renew to maintain access.\n\n"
-        
+            msg += "⚠️ Your subscription is expiring soon! Renew to maintain access.\n\n"
+
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("🔄 Renew", callback_data="premium_plans")],
             [InlineKeyboardButton("❌ Close", callback_data="close_message")]
         ])
-        
-        await message.reply_text(
-            message_text,
-            reply_markup=keyboard
-        )
+
+        await message.reply_text(msg, reply_markup=keyboard)
 
     def get_back_button(self, back_to: str) -> InlineKeyboardButton:
         """Returns a consistent back button"""
