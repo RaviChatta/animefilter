@@ -28,7 +28,6 @@ class Scripts(object):
 - /start — Show main menu
 - /search <anime name> — Search for anime (you can also just send the anime name)
 - /index — Browse anime alphabetically
-- /recent — View recently updated anime
 - /ongoing — See currently airing/releasing anime
 - /watchlist — View and manage your saved anime
 - /todayschedule — View today's anime release schedule
@@ -57,7 +56,7 @@ class Scripts(object):
     ANIME_INFO_TEXT = """
 <font face="Georgia" size="4"><b>{title}</b></font><br>
 <font face="Arial" size="2">
-✦ <b>Type:</b> <i>{type_display}</i> &nbsp; | &nbsp; <b>Status:</b> <i>{status}</i> &nbsp; | &nbsp; <b>Score:</b> <i>{score_html}</i><br>
+✦ <b>Type:</b> <i>{type_display}</i> &nbsp; | &nbsp; <b>Status:</b> <i>{status}</i><br>
 ✦ <b>Episodes:</b> <i>{episodes}{ep_text}</i> &nbsp; | &nbsp; <b>Year:</b> <i>{year}</i><br>
 ✦ <b>Genres:</b> <i>{genres}</i><br><br>
 ✦ <b>Synopsis:</b><br>
