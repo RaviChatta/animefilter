@@ -1950,16 +1950,6 @@ class AnimeBot:
                 return
 
             # Check if the number of files exceeds user's remaining download limit
-            if self.config.PREMIUM_MODE:
-                user = await self.db.users_collection.find_one({"user_id": user_id})
-                remaining = max(0, self.config.PREMIUM_DOWNLOAD_LIMIT - user.get('download_count', 0))
-                if len(all_files) > remaining:
-                    await callback_query.answer(
-                        f"You can only download {remaining} more files (limit: {self.config.PREMIUM_DOWNLOAD_LIMIT}). "
-                        "Please select fewer files or wait for limit reset.",
-                        show_alert=True
-                    )
-                    return
 
             # Send processing message
             processing_msg = await callback_query.message.reply_text(
