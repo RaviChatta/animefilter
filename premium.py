@@ -521,14 +521,14 @@ class Premium:
         message = "💎 *Premium Plans*\n\n"
         message += "🔹 *Premium Features:*\n"
         message += "- Unlimited downloads\n"
-        message += "- One-click download for all \n"
-
+        message += "- One-click download for all\n"
         message += "- Priority support\n\n"
-        message += "🔞 *H-Premium Features:*\n"
+        message += "_⚙️ Premium helps keep the bot running long-term (VPS & maintenance)._ \n\n"
+        message += "🔞 *H-Premium Features:* (Coming soon if users are interested)\n"
         message += "- All Premium features\n"
         message += "- Access to H@ntai/A content\n\n"
         message += "Select a plan to view details:"
-        
+
         keyboard = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("💎 Premium", callback_data="premium_benefits_premium"),
