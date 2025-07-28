@@ -38,6 +38,7 @@ from dotenv import load_dotenv
 from bson import ObjectId
 from settings import config
 from scripts import Scripts
+from anime_quotes import AnimeQuotes
 
 
 
@@ -930,6 +931,7 @@ class AnimeBot:
         self.file_lists = {}
         self.rate_limit = {}
         self.premium = Premium(self.db, self.config, self)
+        self.quotes = AnimeQuotes(self)  # No initialize needed here
 
         self.settings = {
             'delete_timer': {
@@ -2078,9 +2080,12 @@ class AnimeBot:
                 await processing_msg.delete()
                 
                 result_msg = (
-                    f"✅ Successfully sent {success_count}/{len(all_files)} episodes!\n"
-                    f"⚠️ Files will auto-delete in {Config.DELETE_TIMER_MINUTES} minute(s)."
+                    f"<blockquote>\n"
+                    f"Successfully sent {success_count}/{len(all_files)} episodes!<br>\n"
+                    f"Files will auto-delete in {Config.DELETE_TIMER_MINUTES} minute(s).\n"
+                    f"</blockquote>"
                 )
+
                 
                 if errors:
                     result_msg += f"\n\nFailed episodes: {', '.join(errors[:10])}" + ("..." if len(errors) > 10 else "")
@@ -2259,7 +2264,11 @@ class AnimeBot:
                 sent_file_msg = await send_file(user_id)
                 warning_msg = await client.send_message(
                     chat_id=user_id,
-                    text=f"⚠️ This file will auto-delete in {Config.DELETE_TIMER_MINUTES} minute(s).",
+                    text = f"""
+                        <blockquote>
+                        ⚠️ This file will auto-delete in {Config.DELETE_TIMER_MINUTES} minute(s).
+                        </blockquote>
+                        """,
                     parse_mode=enums.ParseMode.HTML
                 )
 
@@ -2406,7 +2415,11 @@ class AnimeBot:
 
                     warning_msg = await client.send_message(
                         chat_id=user_id,
-                        text=f"⚠️ File auto-deletes in {Config.DELETE_TIMER_MINUTES} minute(s).",
+                        text = f"""
+                        <blockquote>
+                        ⚠️ This file will auto-delete in {Config.DELETE_TIMER_MINUTES} minute(s).
+                        </blockquote>
+                        """,
                         parse_mode=enums.ParseMode.HTML
                     )
 
@@ -2432,7 +2445,11 @@ class AnimeBot:
 
                     warning_msg = await client.send_message(
                         chat_id=callback_query.message.chat.id,
-                        text=f"⚠️ File auto-deletes in {Config.DELETE_TIMER_MINUTES} minute(s).",
+                        text = f"""
+                        <blockquote>
+                        ⚠️ This file will auto-delete in {Config.DELETE_TIMER_MINUTES} minute(s).
+                        </blockquote>
+                        """,
                         parse_mode=enums.ParseMode.HTML
                     )
 
@@ -2537,18 +2554,19 @@ class AnimeBot:
                 await self.update_message(
                     client,
                     message.message,
-                    f"🔄 Currently Releasing Anime (Page {page}/{total_pages}):\n\n"
-                    "Numbers show uploaded/total episodes\n"
-                    "Select an anime to view details:",
+                    f"<blockquote>🔄 Currently Releasing Anime (Page {page}/{total_pages}):</blockquote>\n"
+                    f"<blockquote>Numbers show uploaded/total episodes</blockquote>\n"
+                    f"<blockquote>Select an anime to view details:</blockquote>",
                     reply_markup=InlineKeyboardMarkup(keyboard)
                 )
             else:
                 await message.reply_text(
-                    f"🔄 Currently Releasing Anime (Page {page}/{total_pages}):\n\n"
-                    "Numbers show uploaded/total episodes\n"
-                    "Select an anime to view details:",
+                    f"<blockquote>🔄 Currently Releasing Anime (Page {page}/{total_pages}):</blockquote>\n"
+                    f"<blockquote>Numbers show uploaded/total episodes</blockquote>\n"
+                    f"<blockquote>Select an anime to view details:</blockquote>",
                     reply_markup=InlineKeyboardMarkup(keyboard)
                 )
+
 
         except Exception as e:
             logger.error(f"Error in ongoing_command: {e}")
@@ -2625,7 +2643,10 @@ class AnimeBot:
             message += "⚠️ These actions are powerful and irreversible!\n\n"
             message += f"Current Owners: {len(Config.OWNERS)}\n"
             message += f"Current Admins: {len(Config.ADMINS)}\n"
-
+            message += f"To unlink sequals use /unlinksequel\n"
+            message += f"use /restart to restart bot \n"
+            message += f"use /setlimit to set limits \n"
+            
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("👑 Add Owner", callback_data="owner_add"),
                  InlineKeyboardButton("🚫 Remove Owner", callback_data="owner_remove")],
@@ -5293,15 +5314,8 @@ class AnimeBot:
 
     async def show_start_menu(self, client: Client, callback_query: CallbackQuery):
         user = callback_query.from_user
-        welcome_text = (
-            f"Hi {user.first_name}! Welcome  🎉\n\n"
-            "🔎 Search for your favorite anime\n"
-            "📚 Explore our extensive anime library\n"
-            "📥 Download episodes in multiple qualities \n"
-            "📋 Add anime to your watchlist\n\n"
-            "Get started with the buttons below!"
-        )
-        
+        welcome_text = Scripts.WELCOME_TEXT.format(first_name=user.first_name)
+
 
         keyboard = InlineKeyboardMarkup([
             [
@@ -6406,7 +6420,7 @@ async def main():
             logger.error(f"Error unlinking sequels: {e}")
             await message.reply_text("❌ Error unlinking sequels")
 
-    @app.on_message(filters.command(["browse", "watchlist", "recent", "admin", "stats"]))
+    @app.on_message(filters.command(["index", "watchlist", "recent", "admin", "stats"]))
     async def handle_commands(client: Client, message: Message):
         try:
             # Basic rate-limiting check
@@ -6417,7 +6431,7 @@ async def main():
             command = message.command[0].lower()
 
             # Command handling logic
-            if command == "browse":
+            if command == "index":
                 await bot.browse_command(client, message)
 
             elif command == "watchlist":
@@ -6482,22 +6496,7 @@ async def main():
             ])
         )
         # React to the user's message with a random emoji
-       
-    @app.on_message(filters.command(["recent", "updates"]) & (filters.private | (filters.group & filters.chat(Config.GROUP_ID) if Config.GROUP_ID else filters.group)))
-    async def recent_command(client: Client, message: Message):
-        class FakeCallbackQuery:
-            def __init__(self, message):
-                self.from_user = message.from_user
-                self.message = message
-                self.data = 'recent_updates'
-                
-            async def answer(self, *args, **kwargs):
-                pass
-                
-        fake_query = FakeCallbackQuery(message)
-        await bot.show_recent_updates(client, fake_query)
-        # React to the user's message with a random emoji
-       
+    
       
     @app.on_message(filters.command("linksequel") & filters.private & filters.user(Config.ADMINS))
     async def link_sequel_command(client: Client, message: Message):
@@ -6537,31 +6536,6 @@ async def main():
             await message.reply_text("✅ Successfully linked the sequels!")
         except Exception as e:
             logger.error(f"Error linking sequels: {e}")
-    @app.on_message(filters.command("episode") & filters.private & filters.user(Config.ADMINS))
-    async def set_episode_override(client: Client, message: Message):
-        try:
-            if len(message.command) < 2:
-                await message.reply_text("Usage: /episode <number>")
-                return
-                
-            if not message.reply_to_message:
-                await message.reply_text("Please reply to a file message")
-                return
-                
-            episode = int(message.command[1])
-            user_id = message.from_user.id
-            
-            if user_id not in bot.user_sessions:
-                bot.user_sessions[user_id] = {}
-                
-            bot.user_sessions[user_id]['manual_episode'] = episode
-            await message.reply_text(f"Episode set to {episode}. Now send the file again.")
-            
-        except ValueError:
-            await message.reply_text("Invalid episode number")
-        except Exception as e:
-            logger.error(f"Episode override error: {e}")
-            await message.reply_text("Error setting episode")
     @app.on_message(filters.command("resetdb") & filters.private & filters.user(Config.OWNERS))
     async def reset_db_command(client: Client, message: Message):
         class FakeCallbackQuery:
@@ -6575,7 +6549,10 @@ async def main():
                 
         fake_query = FakeCallbackQuery(message)
         await bot.reset_database_confirm(client, fake_query)
-
+    @app.on_message(filters.command("quote") & ( filters.group))
+    async def quote_command(client: Client, message: Message):
+        await bot.quotes.send_quote(client, message)
+ 
     @app.on_message(filters.command("addadmin") & filters.private & filters.user(Config.ADMINS))
     async def add_admin_command(client: Client, message: Message):
         if len(message.command) < 2:
@@ -6717,8 +6694,7 @@ async def main():
             anime_list = await bot.db.search_anime(query, Config.MAX_SEARCH_RESULTS)
 
             for anime in anime_list:
-                score = f"⭐ {anime.get('score')}" if anime.get('score') else ""
-                title = f"{anime['title']} ({anime.get('episodes', '?')} eps) {score}"
+                title = f"{anime['title']} ({anime.get('episodes', '?')} eps)"
 
                 results.append(
                     InlineQueryResultArticle(
@@ -6727,8 +6703,8 @@ async def main():
                             f"🔍 *Search result for '{query}':*\n\n"
                             f"🎬 *{anime['title']}*\n"
                             f"📺 *Episodes:* {anime.get('episodes', '?')}\n"
-                            f"🏢 *Studio:* {anime.get('studio', 'Unknown')}\n"
-                            f"{score}",
+                            f"🏢 *Studio:* {anime.get('studio', 'Unknown')}\n",
+                          
                             parse_mode=enums.ParseMode.MARKDOWN
                         ),
                         reply_markup=InlineKeyboardMarkup([[
