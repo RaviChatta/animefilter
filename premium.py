@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 from pyrogram import Client, filters
@@ -111,7 +112,6 @@ class Premium:
                 return self._has_hpremium(user_data)
 
         return self._check_access_level(user_data, required_level)
-
 
     async def _get_user_data(self, user_id: int) -> Dict:
         """
@@ -388,7 +388,7 @@ class Premium:
                 [InlineKeyboardButton("🔙 Back", callback_data=f"grant_{plan_type}")]
             ])
         )
-    async def grant_premium(self, client: Client, message: Message):
+     async def grant_premium(self, client: Client, message: Message):
         """Properly handle premium granting with verification"""
         try:
             # Parse command arguments
@@ -416,7 +416,8 @@ class Premium:
                 return await message.reply("❌ Verification failed - user not found in premium collection")
             
             # Update user cache
-            await self.premium.update_user_cache(user_id)
+            if hasattr(self, 'premium_cache'):
+                self.premium_cache.pop(user_id, None)
             
             # Send success message with details
             expiry_date = premium_user['expiry_date'].strftime('%Y-%m-%d')
@@ -426,16 +427,23 @@ class Premium:
                 f"🔍 Verify with: /check_premium {user_id}"
             )
             
-            # Optional: Notify the user
+            # Notify the user with improved error handling
             try:
+                plan_name = self.premium_plans.get(plan_type, {}).get('name', plan_type.capitalize())
                 await client.send_message(
                     user_id,
-                    f"🎉 You've been granted {plan_type} access!\n"
-                    f"⏳ Expires: {expiry_date}\n"
-                    f"💎 Features unlocked!"
+                    f"🎉 *Congratulations!*\n\n"
+                    f"You've been granted *{plan_name}* access!\n"
+                    f"⏳ *Expires:* {expiry_date}\n\n"
+                    f"💎 *Features unlocked:*\n"
+                    "- Unlimited downloads\n"
+                    "- Priority access\n"
+                    f"{'- Adult content access\n' if plan_type == 'hpremium' else ''}\n"
+                    "Use /myplan to check your status anytime."
                 )
-            except:
-                pass
+            except Exception as e:
+                logger.warning(f"Could not notify user {user_id} about premium grant: {e}")
+                await message.reply(f"✅ Premium granted but couldn't notify user (they may need to start the bot first)")
                 
         except Exception as e:
             logger.error(f"Error in grant_premium: {e}", exc_info=True)
