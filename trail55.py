@@ -931,6 +931,7 @@ class AnimeBot:
         self.file_lists = {}
         self.rate_limit = {}
         self.premium = Premium(self.db, self.config, self)
+        self.quotes = AnimeQuotes(self)  # No initialize needed here
 
         self.settings = {
             'delete_timer': {
@@ -1066,26 +1067,30 @@ class AnimeBot:
         return total
 
     
-    def format_timedelta(td: timedelta) -> str:
-        days = td.days
-        hours, remainder = divmod(td.seconds, 3600)
-        minutes, seconds = divmod(remainder, 60)
-        return f"{days}d {hours}h {minutes}m {seconds}s"
-    
-    def format_mb(bytes_value):
-        return f"{bytes_value / 1024 / 1024:.2f}MB"
-    
-    async def get_uptime() -> timedelta:
-        try:
-            with open('/proc/uptime', 'r') as f:
-                uptime_seconds = float(f.readline().split()[0])
-            return timedelta(seconds=int(uptime_seconds))
-        except Exception:
-            return datetime.now() - datetime.fromtimestamp(psutil.boot_time())
-    
     async def status_command(self, client: Client, message: Message):
         """Enhanced status command with clean metrics and robust formatting"""
         try:
+            from datetime import datetime, timedelta
+            import psutil
+            import asyncio
+    
+            def format_timedelta(td: timedelta) -> str:
+                days = td.days
+                hours, remainder = divmod(td.seconds, 3600)
+                minutes, seconds = divmod(remainder, 60)
+                return f"{days}d {hours}h {minutes}m {seconds}s"
+    
+            def format_mb(bytes_value):
+                return f"{bytes_value / 1024 / 1024:.2f}MB"
+    
+            async def get_uptime() -> timedelta:
+                try:
+                    with open('/proc/uptime', 'r') as f:
+                        uptime_seconds = float(f.readline().split()[0])
+                    return timedelta(seconds=int(uptime_seconds))
+                except Exception:
+                    return datetime.now() - datetime.fromtimestamp(psutil.boot_time())
+    
             # 🖥️ System info
             memory = psutil.virtual_memory()
             disk = psutil.disk_usage('/')
@@ -1095,7 +1100,9 @@ class AnimeBot:
             # 👥 User stats
             stats = await self.db.stats_collection.find_one({"type": "global"}) or {}
             total_users = await self.db.users_collection.count_documents({})
-            premium_users = await self.db.premium_users.count_documents({"expiry_date": {"$gt": datetime.now()}})
+            premium_users = await self.db.premium_users.count_documents({
+                "expiry_date": {"$gt": datetime.now()}
+            })
     
             # 📦 Cluster stats
             cluster_info = []
@@ -6719,7 +6726,7 @@ async def main():
     @app.on_callback_query()
     async def callback_query(client: Client, callback_query: CallbackQuery):
         await bot.handle_callback_query(client, callback_query)
-     @app.on_message(filters.command("quote") & ( filters.group))
+    @app.on_message(filters.command("quote") & ( filters.group))
     async def quote_command(client: Client, message: Message):
         await bot.quotes.send_quote(client, message)
  
