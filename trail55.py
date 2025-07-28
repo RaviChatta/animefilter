@@ -39,6 +39,7 @@ from bson import ObjectId
 from settings import config
 from scripts import Scripts
 
+from anime_quotes import AnimeQuotes
 
 
 
@@ -1063,26 +1064,44 @@ class AnimeBot:
             except Exception as e:
                 logger.warning(f"Error counting episodes in cluster: {e}")
         return total
+
+    
+    def format_timedelta(td: timedelta) -> str:
+        days = td.days
+        hours, remainder = divmod(td.seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{days}d {hours}h {minutes}m {seconds}s"
+    
+    def format_mb(bytes_value):
+        return f"{bytes_value / 1024 / 1024:.2f}MB"
+    
+    async def get_uptime() -> timedelta:
+        try:
+            with open('/proc/uptime', 'r') as f:
+                uptime_seconds = float(f.readline().split()[0])
+            return timedelta(seconds=int(uptime_seconds))
+        except Exception:
+            return datetime.now() - datetime.fromtimestamp(psutil.boot_time())
+    
     async def status_command(self, client: Client, message: Message):
         """Enhanced status command with clean metrics and robust formatting"""
         try:
             # 🖥️ System info
             memory = psutil.virtual_memory()
             disk = psutil.disk_usage('/')
-            cpu_percent = psutil.cpu_percent()
-            uptime = datetime.now() - datetime.fromtimestamp(psutil.boot_time())
-
+            cpu_percent = psutil.cpu_percent(interval=0.5)
+            uptime = await get_uptime()
+    
             # 👥 User stats
             stats = await self.db.stats_collection.find_one({"type": "global"}) or {}
             total_users = await self.db.users_collection.count_documents({})
             premium_users = await self.db.premium_users.count_documents({"expiry_date": {"$gt": datetime.now()}})
-
+    
             # 📦 Cluster stats
             cluster_info = []
             total_anime = 0
             total_files = 0
-
-            # Check if database is initialized and has anime_clients
+    
             if not hasattr(self.db, 'anime_clients') or not self.db.anime_clients:
                 cluster_info.append("🔹 No database clusters configured or initialized")
             else:
@@ -1093,94 +1112,106 @@ class AnimeBot:
                         files_count = await db.files.estimated_document_count()
                         total_anime += anime_count
                         total_files += files_count
-
+    
                         db_stats = await db.command("dbStats")
                         data_size_mb = db_stats.get('dataSize', 0) / (1024 * 1024)
                         index_size_mb = db_stats.get('indexSize', 0) / (1024 * 1024)
-
+    
                         cluster_info.append(
-                            f"🔹 *Cluster {i}*\n"
-                            f"   - Status: ✅ Online\n"
-                            f"   - Anime: `{anime_count}`\n"
-                            f"   - Files: `{files_count}`\n"
-                            f"   - Data Size: `{data_size_mb:.2f} MB`\n"
-                            f"   - Index Size: `{index_size_mb:.2f} MB`"
+                            f"🔹 <b>Cluster {i}</b><br>"
+                            f"   • Status: ✅ Online<br>"
+                            f"   • Anime: <code>{anime_count}</code><br>"
+                            f"   • Files: <code>{files_count}</code><br>"
+                            f"   • Data Size: <code>{data_size_mb:.2f} MB</code><br>"
+                            f"   • Index Size: <code>{index_size_mb:.2f} MB</code>"
                         )
                     except Exception as e:
                         cluster_info.append(
-                            f"🔹 *Cluster {i}*\n"
-                            f"   - Status: ❌ Offline\n"
-                            f"   - Error: `{str(e)[:100]}`"
+                            f"🔹 <b>Cluster {i}</b><br>"
+                            f"   • Status: ❌ Offline<br>"
+                            f"   • Error: <code>{str(e)[:100]}</code>"
                         )
-
+    
             total_episodes = await self.count_total_episodes(count_unique=True)
-
+    
             # 👤 User DB status
             try:
                 user_stats = await self.db.users_client[self.db.db_name].command("dbStats")
                 user_data_size = user_stats.get('dataSize', 0) / (1024 * 1024)
                 user_index_size = user_stats.get('indexSize', 0) / (1024 * 1024)
-
+    
                 user_db_info = (
-                    f"👤 *Users Database*\n"
-                    f"   - Status: ✅ Online\n"
-                    f"   - Users: `{total_users}`\n"
-                    f"   - Premium: `{premium_users}`\n"
-                    f"   - Data Size: `{user_data_size:.2f} MB`\n"
-                    f"   - Index Size: `{user_index_size:.2f} MB`"
+                    f"👤 <b>Users Database</b><br>"
+                    f"   • Status: ✅ Online<br>"
+                    f"   • Users: <code>{total_users}</code><br>"
+                    f"   • Premium: <code>{premium_users}</code><br>"
+                    f"   • Data Size: <code>{user_data_size:.2f} MB</code><br>"
+                    f"   • Index Size: <code>{user_index_size:.2f} MB</code>"
                 )
             except Exception as e:
                 user_db_info = (
-                    f"👤 *Users Database*\n"
-                    f"   - Status: ❌ Offline\n"
-                    f"   - Error: `{str(e)[:100]}`"
+                    f"👤 <b>Users Database</b><br>"
+                    f"   • Status: ❌ Offline<br>"
+                    f"   • Error: <code>{str(e)[:100]}</code>"
                 )
-
+    
             # 📊 Insert distribution
             insert_stats = getattr(self.db, 'insert_stats', {})
             total_inserts = insert_stats.get('total_inserts', 0)
             cluster_counts = insert_stats.get('cluster_counts', {})
-            cluster_dist = [
-                f"🔹 Cluster {i}: {count} inserts ({(count / total_inserts) * 100:.1f}%)"
-                for i, count in cluster_counts.items()
-            ] if total_inserts > 0 else ["No insert activity yet."]
-
+    
+            if total_inserts > 0:
+                cluster_dist = [
+                    f"🔹 Cluster {i}: <code>{count}</code> inserts "
+                    f"({(count / total_inserts) * 100:.1f}%)"
+                    for i, count in cluster_counts.items()
+                ]
+            else:
+                cluster_dist = ["No insert activity yet."]
+    
             # 📄 Final message
             message_text = (
-                f"📊 *{Config.BOT_NAME} Status*\n\n"
-                f"🖥️ *System*\n"
-                f"• CPU: `{cpu_percent}%`\n"
-                f"• Memory: `{memory.percent}%` ({memory.used / 1024 / 1024:.0f}MB/{memory.total / 1024 / 1024:.0f}MB)\n"
-                f"• Disk: `{disk.percent}%` ({disk.used / 1024 / 1024:.0f}MB/{disk.total / 1024 / 1024:.0f}MB)\n"
-                f"• Uptime: `{str(uptime).split('.')[0]}`\n\n"
-
-                f"📈 *Stats*\n"
-                f"• Anime: `{total_anime}`\n"
-                f"• Files: `{total_files}`\n"
-                f"• Episodes: `{total_episodes}`\n"
-                f"• Users: `{total_users}`\n"
-                f"• Premium Users: `{premium_users}`\n"
-                f"• Searches: `{stats.get('total_searches', 0)}`\n"
-                f"• Downloads: `{stats.get('total_downloads', 0)}`\n\n"
-
-                f"🗃️ *Database Clusters*\n" +
-                "\n\n".join(cluster_info) + "\n\n" +
-                user_db_info + "\n\n" +
-                "📊 *Insert Distribution*\n" +
-                "\n".join(cluster_dist)
+                f"<b>📊 {Config.BOT_NAME} Status</b>\n\n"
+    
+                f"<b>🖥️ System</b><br>"
+                f"• CPU: <code>{cpu_percent}%</code><br>"
+                f"• Memory: <code>{memory.percent}%</code> "
+                f"({format_mb(memory.used)}/{format_mb(memory.total)})<br>"
+                f"• Disk: <code>{disk.percent}%</code> "
+                f"({format_mb(disk.used)}/{format_mb(disk.total)})<br>"
+                f"• Uptime: <code>{format_timedelta(uptime)}</code>\n\n"
+    
+                f"<b>📈 Stats</b><br>"
+                f"• Anime: <code>{total_anime}</code><br>"
+                f"• Files: <code>{total_files}</code><br>"
+                f"• Episodes: <code>{total_episodes}</code><br>"
+                f"• Users: <code>{total_users}</code><br>"
+                f"• Premium Users: <code>{premium_users}</code><br>"
+                f"• Searches: <code>{stats.get('total_searches', 0)}</code><br>"
+                f"• Downloads: <code>{stats.get('total_downloads', 0)}</code>\n\n"
+    
+                f"<b>🗃️ Database Clusters</b><br>"
+                + "<br><br>".join(cluster_info) +
+                "\n\n"
+    
+                f"{user_db_info}\n\n"
+    
+                f"<b>📊 Insert Distribution</b><br>"
+                + "<br>".join(cluster_dist)
             )
-
-            # Send message
+    
             sent_msg = await message.reply_text(
                 message_text,
-                parse_mode=enums.ParseMode.MARKDOWN
+                parse_mode=enums.ParseMode.HTML,
+                disable_web_page_preview=True
             )
             await asyncio.sleep(120)
             await sent_msg.delete()
-
+    
         except Exception as e:
             logger.error(f"Status command error: {e}", exc_info=True)
             await message.reply_text("⚠️ Error retrieving status information.")
+
     async def get_anime_title(self, anime_id: int) -> str:
         anime = await self.db.find_anime(anime_id)
         return anime["title"] if anime else "Unknown Anime"
@@ -1277,8 +1308,8 @@ class AnimeBot:
                 await message.reply_text(
                     "⭐ Your watchlist is empty.\nAdd anime to your watchlist from their details page.",
                     reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🔍 Search Anime", switch_inline_query_current_chat="")],
-                        [InlineKeyboardButton("📜 Browse Anime", callback_data="available_anime")]
+                        [InlineKeyboardButton("🔍 ꜱᴇᴀʀᴄʜ ᴀɴɪᴍᴇ", switch_inline_query_current_chat="")],
+                        [InlineKeyboardButton("📜 ʙʀᴏᴡꜱᴇ ᴀɴɪᴍᴇ", callback_data="available_anime")]
                     ]))
                 return
             
@@ -1889,7 +1920,7 @@ class AnimeBot:
                 client,
                 callback_query.message,
                 f"<b>Choose quality for:</b>\n<blockquote>{anime['title']}</blockquote>\n"
-                "All available episodes will be sent to your PM",
+                "𝗔𝗹𝗹 𝗮𝘃𝗮𝗶𝗹𝗮𝗯𝗹𝗲 𝗲𝗽𝗶𝘀𝗼𝗱𝗲𝘀 𝘄𝗶𝗹𝗹 𝗯𝗲 𝘀𝗲𝗻𝘁 𝘁𝗼 𝘆𝗼𝘂𝗿 𝗣𝗠",
                 reply_markup=reply_markup
             )
 
@@ -2041,10 +2072,12 @@ class AnimeBot:
             try:
                 await processing_msg.delete()
                 
-                result_msg = (
-                    f"✅ Successfully sent {success_count}/{len(all_files)} episodes!\n"
-                    f"⚠️ Files will auto-delete in {Config.DELETE_TIMER_MINUTES} minute(s)."
-                )
+                result_msg = f"""
+                <blockquote>
+                    Successfully sent {success_count}/{len(all_files)} episodes!<br>
+                    Files will auto-delete in {Config.DELETE_TIMER_MINUTES} minute(s).
+                </blockquote>
+                """
                 
                 if errors:
                     result_msg += f"\n\nFailed episodes: {', '.join(errors[:10])}" + ("..." if len(errors) > 10 else "")
@@ -2224,7 +2257,11 @@ class AnimeBot:
                 sent_file_msg = await send_file(user_id)
                 warning_msg = await client.send_message(
                     chat_id=user_id,
-                    text=f"⚠️ This file will auto-delete in {Config.DELETE_TIMER_MINUTES} minute(s).",
+                    text = f"""
+                    <blockquote>
+                    ⚠️ This file will auto-delete in {Config.DELETE_TIMER_MINUTES} minute(s).
+                    </blockquote>
+                    """,                    
                     parse_mode=enums.ParseMode.HTML
                 )
 
@@ -2237,7 +2274,11 @@ class AnimeBot:
                     sent_file_msg = await send_file(message.chat.id)
                     warning_msg = await client.send_message(
                         chat_id=message.chat.id,
-                        text=f"⚠️ This file will auto-delete in {Config.DELETE_TIMER_MINUTES} minute(s).",
+                        text = f"""
+                        <blockquote>
+                        ⚠️ This file will auto-delete in {Config.DELETE_TIMER_MINUTES} minute(s).
+                        </blockquote>
+                        """,
                         parse_mode=enums.ParseMode.HTML
                     )
                 except Exception as group_error:
@@ -2371,7 +2412,11 @@ class AnimeBot:
 
                     warning_msg = await client.send_message(
                         chat_id=user_id,
-                        text=f"⚠️ File auto-deletes in {Config.DELETE_TIMER_MINUTES} minute(s).",
+                        text = f"""
+                        <blockquote>
+                        ⚠️ This file will auto-delete in {Config.DELETE_TIMER_MINUTES} minute(s).
+                        </blockquote>
+                        """,               
                         parse_mode=enums.ParseMode.HTML
                     )
 
@@ -2397,7 +2442,11 @@ class AnimeBot:
 
                     warning_msg = await client.send_message(
                         chat_id=callback_query.message.chat.id,
-                        text=f"⚠️ File auto-deletes in {Config.DELETE_TIMER_MINUTES} minute(s).",
+                        text = f"""
+                          <blockquote>
+                          ⚠️ This file will auto-delete in {Config.DELETE_TIMER_MINUTES} minute(s).
+                          </blockquote>
+                          """,
                         parse_mode=enums.ParseMode.HTML
                     )
 
@@ -2502,18 +2551,19 @@ class AnimeBot:
                 await self.update_message(
                     client,
                     message.message,
-                    f"🔄 Currently Releasing Anime (Page {page}/{total_pages}):\n\n"
-                    "Numbers show uploaded/total episodes\n"
-                    "Select an anime to view details:",
+                    f"<blockquote>🔄 Currently Releasing Anime (Page {page}/{total_pages}):</blockquote>\n"
+                    f"<blockquote>Numbers show uploaded/total episodes</blockquote>\n"
+                    f"<blockquote>Select an anime to view details:</blockquote>",
                     reply_markup=InlineKeyboardMarkup(keyboard)
                 )
             else:
                 await message.reply_text(
-                    f"🔄 Currently Releasing Anime (Page {page}/{total_pages}):\n\n"
-                    "Numbers show uploaded/total episodes\n"
-                    "Select an anime to view details:",
+                    f"<blockquote>🔄 Currently Releasing Anime (Page {page}/{total_pages}):</blockquote>\n"
+                    f"<blockquote>Numbers show uploaded/total episodes</blockquote>\n"
+                    f"<blockquote>Select an anime to view details:</blockquote>",
                     reply_markup=InlineKeyboardMarkup(keyboard)
                 )
+
 
         except Exception as e:
             logger.error(f"Error in ongoing_command: {e}")
@@ -2590,6 +2640,9 @@ class AnimeBot:
             message += "⚠️ These actions are powerful and irreversible!\n\n"
             message += f"Current Owners: {len(Config.OWNERS)}\n"
             message += f"Current Admins: {len(Config.ADMINS)}\n"
+            message += f"To unlink sequals use /unlinksequel\n"
+            message += f"use /restart to restart bot \n"
+            message += f"use /setlimit to set limits \n"
 
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("👑 Add Owner", callback_data="owner_add"),
@@ -3491,7 +3544,7 @@ class AnimeBot:
             await message.reply_text("❌ Owner only")
             return
         
-        await message.reply_text("🔄 Restarting bot...")
+        await message.reply_text("🔄 Restarting bot...use after 3 mins")
         os.execv(sys.executable, [sys.executable] + sys.argv)
     async def add_db_channel_start(self, client: Client, callback_query: CallbackQuery):
         if callback_query.from_user.id not in Config.ADMINS:
@@ -6440,7 +6493,7 @@ async def main():
 
         await message.reply_text(
             help_text,
-            parse_mode=enums.ParseMode.MARKDOWN,
+            parse_mode=enums.ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
               #  [InlineKeyboardButton("🔙 Back to Start", callback_data="start_menu")],
                 [InlineKeyboardButton("❌ Close", callback_data="close_message")]
@@ -6666,6 +6719,9 @@ async def main():
     @app.on_callback_query()
     async def callback_query(client: Client, callback_query: CallbackQuery):
         await bot.handle_callback_query(client, callback_query)
+     @app.on_message(filters.command("quote") & ( filters.group))
+    async def quote_command(client: Client, message: Message):
+        await bot.quotes.send_quote(client, message)
  
     # Inline query handler
 
@@ -6682,8 +6738,7 @@ async def main():
             anime_list = await bot.db.search_anime(query, Config.MAX_SEARCH_RESULTS)
 
             for anime in anime_list:
-                score = f"⭐ {anime.get('score')}" if anime.get('score') else ""
-                title = f"{anime['title']} ({anime.get('episodes', '?')} eps) {score}"
+                title = f"{anime['title']} ({anime.get('episodes', '?')} eps)"
 
                 results.append(
                     InlineQueryResultArticle(
@@ -6692,8 +6747,8 @@ async def main():
                             f"🔍 *Search result for '{query}':*\n\n"
                             f"🎬 *{anime['title']}*\n"
                             f"📺 *Episodes:* {anime.get('episodes', '?')}\n"
-                            f"🏢 *Studio:* {anime.get('studio', 'Unknown')}\n"
-                            f"{score}",
+                            f"🏢 *Studio:* {anime.get('studio', 'Unknown')}\n",
+                         
                             parse_mode=enums.ParseMode.MARKDOWN
                         ),
                         reply_markup=InlineKeyboardMarkup([[
