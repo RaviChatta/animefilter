@@ -7,7 +7,7 @@ class Settings:
         1: 20,  # Premium
         2: -1   # H-Premium
     }
-    DELETE_TIMER_MINUTES = 1
+    DELETE_TIMER_MINUTES = 10
     MAX_SEARCH_RESULTS = 10
     MAX_EPISODES_PER_PAGE = 30
     PM_SEARCH = True
