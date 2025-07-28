@@ -1066,23 +1066,45 @@ class AnimeBot:
     async def status_command(self, client: Client, message: Message):
         """Enhanced status command with clean metrics and robust formatting"""
         try:
+            from datetime import datetime, timedelta
+            import psutil
+            import asyncio
+    
+            def format_timedelta(td: timedelta) -> str:
+                days = td.days
+                hours, remainder = divmod(td.seconds, 3600)
+                minutes, seconds = divmod(remainder, 60)
+                return f"{days}d {hours}h {minutes}m {seconds}s"
+    
+            def format_mb(bytes_value):
+                return f"{bytes_value / 1024 / 1024:.2f}MB"
+    
+            async def get_uptime() -> timedelta:
+                try:
+                    with open('/proc/uptime', 'r') as f:
+                        uptime_seconds = float(f.readline().split()[0])
+                    return timedelta(seconds=int(uptime_seconds))
+                except Exception:
+                    return datetime.now() - datetime.fromtimestamp(psutil.boot_time())
+    
             # 🖥️ System info
             memory = psutil.virtual_memory()
             disk = psutil.disk_usage('/')
-            cpu_percent = psutil.cpu_percent()
-            uptime = datetime.now() - datetime.fromtimestamp(psutil.boot_time())
-
+            cpu_percent = psutil.cpu_percent(interval=0.5)
+            uptime = await get_uptime()
+    
             # 👥 User stats
             stats = await self.db.stats_collection.find_one({"type": "global"}) or {}
             total_users = await self.db.users_collection.count_documents({})
-            premium_users = await self.db.premium_users.count_documents({"expiry_date": {"$gt": datetime.now()}})
-
+            premium_users = await self.db.premium_users.count_documents({
+                "expiry_date": {"$gt": datetime.now()}
+            })
+    
             # 📦 Cluster stats
             cluster_info = []
             total_anime = 0
             total_files = 0
-
-            # Check if database is initialized and has anime_clients
+    
             if not hasattr(self.db, 'anime_clients') or not self.db.anime_clients:
                 cluster_info.append("🔹 No database clusters configured or initialized")
             else:
@@ -1093,94 +1115,106 @@ class AnimeBot:
                         files_count = await db.files.estimated_document_count()
                         total_anime += anime_count
                         total_files += files_count
-
+    
                         db_stats = await db.command("dbStats")
                         data_size_mb = db_stats.get('dataSize', 0) / (1024 * 1024)
                         index_size_mb = db_stats.get('indexSize', 0) / (1024 * 1024)
-
+    
                         cluster_info.append(
-                            f"🔹 *Cluster {i}*\n"
-                            f"   - Status: ✅ Online\n"
-                            f"   - Anime: `{anime_count}`\n"
-                            f"   - Files: `{files_count}`\n"
-                            f"   - Data Size: `{data_size_mb:.2f} MB`\n"
-                            f"   - Index Size: `{index_size_mb:.2f} MB`"
+                            f"🔹 <b>Cluster {i}</b><br>"
+                            f"   • Status: ✅ Online<br>"
+                            f"   • Anime: <code>{anime_count}</code><br>"
+                            f"   • Files: <code>{files_count}</code><br>"
+                            f"   • Data Size: <code>{data_size_mb:.2f} MB</code><br>"
+                            f"   • Index Size: <code>{index_size_mb:.2f} MB</code>"
                         )
                     except Exception as e:
                         cluster_info.append(
-                            f"🔹 *Cluster {i}*\n"
-                            f"   - Status: ❌ Offline\n"
-                            f"   - Error: `{str(e)[:100]}`"
+                            f"🔹 <b>Cluster {i}</b><br>"
+                            f"   • Status: ❌ Offline<br>"
+                            f"   • Error: <code>{str(e)[:100]}</code>"
                         )
-
+    
             total_episodes = await self.count_total_episodes(count_unique=True)
-
+    
             # 👤 User DB status
             try:
                 user_stats = await self.db.users_client[self.db.db_name].command("dbStats")
                 user_data_size = user_stats.get('dataSize', 0) / (1024 * 1024)
                 user_index_size = user_stats.get('indexSize', 0) / (1024 * 1024)
-
+    
                 user_db_info = (
-                    f"👤 *Users Database*\n"
-                    f"   - Status: ✅ Online\n"
-                    f"   - Users: `{total_users}`\n"
-                    f"   - Premium: `{premium_users}`\n"
-                    f"   - Data Size: `{user_data_size:.2f} MB`\n"
-                    f"   - Index Size: `{user_index_size:.2f} MB`"
+                    f"👤 <b>Users Database</b><br>"
+                    f"   • Status: ✅ Online<br>"
+                    f"   • Users: <code>{total_users}</code><br>"
+                    f"   • Premium: <code>{premium_users}</code><br>"
+                    f"   • Data Size: <code>{user_data_size:.2f} MB</code><br>"
+                    f"   • Index Size: <code>{user_index_size:.2f} MB</code>"
                 )
             except Exception as e:
                 user_db_info = (
-                    f"👤 *Users Database*\n"
-                    f"   - Status: ❌ Offline\n"
-                    f"   - Error: `{str(e)[:100]}`"
+                    f"👤 <b>Users Database</b><br>"
+                    f"   • Status: ❌ Offline<br>"
+                    f"   • Error: <code>{str(e)[:100]}</code>"
                 )
-
+    
             # 📊 Insert distribution
             insert_stats = getattr(self.db, 'insert_stats', {})
             total_inserts = insert_stats.get('total_inserts', 0)
             cluster_counts = insert_stats.get('cluster_counts', {})
-            cluster_dist = [
-                f"🔹 Cluster {i}: {count} inserts ({(count / total_inserts) * 100:.1f}%)"
-                for i, count in cluster_counts.items()
-            ] if total_inserts > 0 else ["No insert activity yet."]
-
+    
+            if total_inserts > 0:
+                cluster_dist = [
+                    f"🔹 Cluster {i}: <code>{count}</code> inserts "
+                    f"({(count / total_inserts) * 100:.1f}%)"
+                    for i, count in cluster_counts.items()
+                ]
+            else:
+                cluster_dist = ["No insert activity yet."]
+    
             # 📄 Final message
             message_text = (
-                f"📊 *{Config.BOT_NAME} Status*\n\n"
-                f"🖥️ *System*\n"
-                f"• CPU: `{cpu_percent}%`\n"
-                f"• Memory: `{memory.percent}%` ({memory.used / 1024 / 1024:.0f}MB/{memory.total / 1024 / 1024:.0f}MB)\n"
-                f"• Disk: `{disk.percent}%` ({disk.used / 1024 / 1024:.0f}MB/{disk.total / 1024 / 1024:.0f}MB)\n"
-                f"• Uptime: `{str(uptime).split('.')[0]}`\n\n"
-
-                f"📈 *Stats*\n"
-                f"• Anime: `{total_anime}`\n"
-                f"• Files: `{total_files}`\n"
-                f"• Episodes: `{total_episodes}`\n"
-                f"• Users: `{total_users}`\n"
-                f"• Premium Users: `{premium_users}`\n"
-                f"• Searches: `{stats.get('total_searches', 0)}`\n"
-                f"• Downloads: `{stats.get('total_downloads', 0)}`\n\n"
-
-                f"🗃️ *Database Clusters*\n" +
-                "\n\n".join(cluster_info) + "\n\n" +
-                user_db_info + "\n\n" +
-                "📊 *Insert Distribution*\n" +
-                "\n".join(cluster_dist)
+                f"<b>📊 {Config.BOT_NAME} Status</b>\n\n"
+    
+                f"<b>🖥️ System</b><br>"
+                f"• CPU: <code>{cpu_percent}%</code><br>"
+                f"• Memory: <code>{memory.percent}%</code> "
+                f"({format_mb(memory.used)}/{format_mb(memory.total)})<br>"
+                f"• Disk: <code>{disk.percent}%</code> "
+                f"({format_mb(disk.used)}/{format_mb(disk.total)})<br>"
+                f"• Uptime: <code>{format_timedelta(uptime)}</code>\n\n"
+    
+                f"<b>📈 Stats</b><br>"
+                f"• Anime: <code>{total_anime}</code><br>"
+                f"• Files: <code>{total_files}</code><br>"
+                f"• Episodes: <code>{total_episodes}</code><br>"
+                f"• Users: <code>{total_users}</code><br>"
+                f"• Premium Users: <code>{premium_users}</code><br>"
+                f"• Searches: <code>{stats.get('total_searches', 0)}</code><br>"
+                f"• Downloads: <code>{stats.get('total_downloads', 0)}</code>\n\n"
+    
+                f"<b>🗃️ Database Clusters</b><br>"
+                + "<br><br>".join(cluster_info) +
+                "\n\n"
+    
+                f"{user_db_info}\n\n"
+    
+                f"<b>📊 Insert Distribution</b><br>"
+                + "<br>".join(cluster_dist)
             )
-
-            # Send message
+    
             sent_msg = await message.reply_text(
                 message_text,
-                parse_mode=enums.ParseMode.MARKDOWN
+                parse_mode=enums.ParseMode.HTML,
+                disable_web_page_preview=True
             )
             await asyncio.sleep(120)
             await sent_msg.delete()
-
+    
         except Exception as e:
             logger.error(f"Status command error: {e}", exc_info=True)
             await message.reply_text("⚠️ Error retrieving status information.")
+
     async def get_anime_title(self, anime_id: int) -> str:
         anime = await self.db.find_anime(anime_id)
         return anime["title"] if anime else "Unknown Anime"
