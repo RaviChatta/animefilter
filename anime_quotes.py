@@ -1352,7 +1352,7 @@ class AnimeQuotes:
           {"quote": "When you're at your limit, you start to understand the people around you.", "character": "Kakashi Hatake", "anime": "Naruto"},
           {"quote": "If you can't find a reason to fight, then you shouldn't be fighting.", "character": "Akame", "anime": "Akame ga Kill!"},
           {"quote": "The world is not beautiful, therefore it is.", "character": "Kino", "anime": "Kino's Journey"},
-          {"quote": "People who can't throw something important away can never hope to change anything.", "character": "Armin Arlert", "
+          {"quote": "People who can't throw something important away can never hope to change anything.", "character": "Armin Arlert"}, 
         ]
     async def send_quote(self, client: Client, message: Message):
         """Send random anime quote (works in both groups and PMs)"""
