@@ -6493,7 +6493,7 @@ async def main():
 
         await message.reply_text(
             help_text,
-            parse_mode=enums.ParseMode.HTML,
+            parse_mode=enums.ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup([
               #  [InlineKeyboardButton("🔙 Back to Start", callback_data="start_menu")],
                 [InlineKeyboardButton("❌ Close", callback_data="close_message")]
