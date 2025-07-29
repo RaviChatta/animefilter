@@ -48,7 +48,7 @@ Ready to get started? Use the buttons below to begin!
 
 🔐 *Premium Features:*
 - 🚀 Unlimited downloads
-- 🎬 Access to adult content (if enabled)
+- 🎬 Access to adult content (if enabled) and users want 
 - 🎧 Higher quality video options
 - ⚡ Faster response and download priority
 
