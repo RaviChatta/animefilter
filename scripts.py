@@ -2,16 +2,14 @@
 
 class Scripts(object):
     WELCOME_TEXT = """
-<blockquote><strong>Hi {first_name}, welcome to Anime Downloader! 🎉</strong></blockquote>
-
+<blockquote><b>Hi {first_name}, welcome to <u>Anime Downloader</u>! 🎉</b></blockquote>
 <blockquote>
-Easily manage and enjoy your favorite anime with the tools below:<br><br>
-✔️ Search for any anime title instantly<br>
-✔️ Browse our complete anime library<br>
-✔️ Download episodes in multiple quality options<br>
-✔️ Add shows to your personal watchlist<br>
-✔️ Keep track of what you’re watching with ease<br><br>
-Ready to get started? Use the buttons below to begin!
+<b>Your anime journey starts here:</b><br><br>
+<b>•</b> <i>Search for any anime title instantly</i><br>
+<b>•</b> <i>Browse the full anime collection</i><br>
+<b>•</b> <i>Download episodes in various quality options</i><br>
+<b>•</b> <i>Save shows to your personal watchlist</i><br>
+<b>•</b> <i>Track your ongoing and completed anime easily</i><br><br>
 </blockquote>
 """
 
@@ -44,7 +42,7 @@ Ready to get started? Use the buttons below to begin!
 - In groups, use `/search <anime>` to look up shows
 - Save ongoing/releasing/upcoming anime in your watchlist to get back to them quickly
 - Files auto-delete after *{delete_timer} minutes*
-- For support and updates, join our group: [Click here]({https://t.me/TFIBOTS_SUPPORT})
+- For support and updates, join our group: [Click here]({group_link})
 
 🔐 *Premium Features:*
 - 🚀 Unlimited downloads
