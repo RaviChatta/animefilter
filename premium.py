@@ -14,7 +14,7 @@ from pyrogram.types import (
 from pyrogram.enums import ParseMode
 from dotenv import load_dotenv
 from settings import config
-from t5 import *
+from ravi import *
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -388,7 +388,7 @@ class Premium:
                 [InlineKeyboardButton("🔙 Back", callback_data=f"grant_{plan_type}")]
             ])
         )
-     async def grant_premium(self, client: Client, message: Message):
+    async def grant_premium(self, client: Client, message: Message):
         """Properly handle premium granting with verification"""
         try:
             # Parse command arguments
@@ -438,9 +438,10 @@ class Premium:
                     f"💎 *Features unlocked:*\n"
                     "- Unlimited downloads\n"
                     "- Priority access\n"
-                    f"{'- Adult content access\n' if plan_type == 'hpremium' else ''}\n"
+                    f"{'- Adult content access' if plan_type == 'hpremium' else ''}\n"
                     "Use /myplan to check your status anytime."
                 )
+
             except Exception as e:
                 logger.warning(f"Could not notify user {user_id} about premium grant: {e}")
                 await message.reply(f"✅ Premium granted but couldn't notify user (they may need to start the bot first)")
