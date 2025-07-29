@@ -859,11 +859,12 @@ class Config:
     ADMINS = list(map(int, os.getenv("ADMINS", "").split(","))) if os.getenv("ADMINS") else []
     DATABASE_CHANNEL_ID = int(os.getenv("DATABASE_CHANNEL_ID", -1002448203068))
     GROUP_ID = int(os.getenv("GROUP_ID")) if os.getenv("GROUP_ID") else None
-    GROUP_LINK = os.getenv("GROUP_LINK", "https://t.me/yourgroup")
+    GROUP_LINK = os.getenv("GROUP_LINK", "https://t.me/TFIBOTS_SUPPORT")
     DELETE_TIMER_MINUTES = int(os.getenv("DELETE_TIMER_MINUTES", 1))
-    BOT_NAME = os.getenv("BOT_NAME", "A2ZBot")
+    BOT_NAME = os.getenv("BOT_NAME", "Anime Downloader Bot")
     MAX_EPISODES_PER_PAGE = 30
     MAX_SEARCH_RESULTS = 10
+    DEVELOPER_USERNAME = "https://t.me/Raaaaavi"
     MAX_BATCH_FILES = 100
     PM_SEARCH = os.getenv("PM_SEARCH", "True") == "True"
     PROTECT_CONTENT = os.getenv("PROTECT_CONTENT", "False") == "True"
@@ -1536,7 +1537,7 @@ class AnimeBot:
 
         keyboard = InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("📢 ᴜᴘᴅᴀᴛᴇꜱ", url="https://t.me/yourchannel")
+                InlineKeyboardButton("📢 ᴜᴘᴅᴀᴛᴇꜱ", url="https://t.me/TFIBOTS")
             ],
             [
                 InlineKeyboardButton("📜 ʙʀᴏᴡꜱᴇ ᴀɴɪᴍᴇ", callback_data="available_anime"),
@@ -5323,7 +5324,7 @@ class AnimeBot:
 
         keyboard = InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("📢 ᴜᴘᴅᴀᴛᴇꜱ", url="https://t.me/yourchannel")
+                InlineKeyboardButton("📢 ᴜᴘᴅᴀᴛᴇꜱ", url="https://t.me/TFIBOTS")
             ],
             [
                 InlineKeyboardButton("📜 ʙʀᴏᴡꜱᴇ ᴀɴɪᴍᴇ", callback_data="available_anime"),
@@ -6489,6 +6490,7 @@ async def main():
             bot_name=Config.BOT_NAME, 
             group_link=Config.GROUP_LINK,
             delete_timer=Config.DELETE_TIMER_MINUTES
+            developer_link=Config.DEVELOPER_USERNAME
         )
 
         await message.reply_text(
