@@ -66,6 +66,8 @@ class Database:
             os.getenv("TERTIARY_MONGO_URI"),
             os.getenv("FOURTH_MONGO_URI"),
             os.getenv("FIFTH_MONGO_URI"),
+            os.getenv("SIXTH_MONGO_URI"),
+            os.getenv("SEVENTH_MONG0_URI"),
             os.getenv("BACKUP_MONGO_URI")
         ]
         self.users_uri = os.getenv("USERS_MONGO_URI")
@@ -2659,8 +2661,8 @@ class AnimeBot:
                 [InlineKeyboardButton("📜 List Owners", callback_data="list_owners"),
                  InlineKeyboardButton("👥 List Admins", callback_data="owner_list_admins")],
 
-                [InlineKeyboardButton("📨 Rate Limit", callback_data="set_rate_limit"),
-                 InlineKeyboardButton("♻️ Reset Database", callback_data="owner_reset_db")],
+       #         [InlineKeyboardButton("📨 Rate Limit", callback_data="set_rate_limit")],
+          #       InlineKeyboardButton("♻️ Reset Database", callback_data="owner_reset_db")],
 
                 [InlineKeyboardButton("🔙 Admin Panel", callback_data="admin_panel"),
                  InlineKeyboardButton("❌ Close", callback_data="close_message")]
