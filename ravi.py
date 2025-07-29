@@ -64,6 +64,8 @@ class Database:
             os.getenv("PRIMARY_MONGO_URI"),
             os.getenv("SECONDARY_MONGO_URI"),
             os.getenv("TERTIARY_MONGO_URI"),
+            os.getenv("FOURTH_MONGO_URI"),
+            os.getenv("FIFTH_MONGO_URI"),
             os.getenv("BACKUP_MONGO_URI")
         ]
         self.users_uri = os.getenv("USERS_MONGO_URI")
