@@ -597,7 +597,7 @@ class Premium:
         faq = (
             "❓ *Premium FAQ*\n\n"
             "🔹 *How do I purchase premium?*\n"
-            "Currently premium can only be granted by admins. Contact @admin for details.\n\n"
+            "Currently premium can only be granted by admins. Contact @sun_godnika_bot for details.\n\n"
             "🔹 *What payment methods are accepted?*\n"
             "We accept PayPal, cryptocurrency, and other payment methods.\n\n"
             "🔹 *How do I check my premium status?*\n"
