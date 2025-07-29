@@ -2,16 +2,19 @@
 
 class Scripts(object):
     WELCOME_TEXT = """
-<blockquote>Hi {first_name}! Welcome 🎉</blockquote>
+<blockquote><strong>Hi {first_name}, welcome to Anime Downloader! 🎉</strong></blockquote>
+
 <blockquote>
-  🔎 Search for your favorite anime<br>
-  📚 Explore our extensive anime library<br>
-  📥 Download episodes in multiple qualities<br>
-  📋 Add anime to your watchlist<br><br>
-  ⭐ Manage your personal watchlist
-  Get started with the buttons below!
+Easily manage and enjoy your favorite anime with the tools below:<br><br>
+✔️ Search for any anime title instantly<br>
+✔️ Browse our complete anime library<br>
+✔️ Download episodes in multiple quality options<br>
+✔️ Add shows to your personal watchlist<br>
+✔️ Keep track of what you’re watching with ease<br><br>
+Ready to get started? Use the buttons below to begin!
 </blockquote>
 """
+
 
 
     HELP_TEXT = """📚 *{bot_name} Help Guide* 📚
@@ -26,7 +29,9 @@ class Scripts(object):
 
 🛠 *Available Commands:*
 - /start — Show main menu
-- /search <anime name> — Search for anime (you can also just send the anime name)
+— Search for anime (you can also just send the anime name)
+- /search <anime name> (in group use by command to search)
+- /quote – Get anime quotes for a bit of inspiration 📖
 - /index — Browse anime alphabetically
 - /ongoing — See currently airing/releasing anime
 - /watchlist — View and manage your saved anime
@@ -37,10 +42,9 @@ class Scripts(object):
 📌 *Usage Tips:*
 - Just send an anime name to search instantly
 - In groups, use `/search <anime>` to look up shows
-- Use inline mode anywhere: `@{bot_name} <anime name>`
-- Save ongoing/releasing anime in your watchlist to get back to them quickly
+- Save ongoing/releasing/upcoming anime in your watchlist to get back to them quickly
 - Files auto-delete after *{delete_timer} minutes*
-- For support and updates, join our group: [Click here]({group_link})
+- For support and updates, join our group: [Click here]({https://t.me/TFIBOTS_SUPPORT})
 
 🔐 *Premium Features:*
 - 🚀 Unlimited downloads
@@ -50,6 +54,7 @@ class Scripts(object):
 
 🆘 *Need Help?*
 - Reach out to admins in our support group or ask your question there!
+- Developed by [R]({https://t.me/Raaaaavi})
 """
 
 
