@@ -162,7 +162,7 @@ class Database:
                 continue
 
             try:
-                client = AsyncIOMotorClient(uri, serverSelectionTimeoutMS=5000)
+                client = AsyncIOMotorClient(uri, serverSelectionTimeoutMS=20000)  # 15 seconds
                 await client.admin.command("ping")
                 self.anime_clients.append(client)
                 self.cluster_status[i] = {
