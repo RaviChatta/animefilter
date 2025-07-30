@@ -1182,33 +1182,34 @@ class AnimeBot:
             # 📄 Final message
             message_text = (
                 f"<b>📊 {Config.BOT_NAME} Status</b>\n\n"
-    
-                f"<b>🖥️ System</b><br>"
-                f"• CPU: <code>{cpu_percent}%</code><br>"
+            
+                f"<b>🖥️ System Info</b>\n"
+                f"• CPU Usage: <code>{cpu_percent}%</code>\n"
                 f"• Memory: <code>{memory.percent}%</code> "
-                f"({format_mb(memory.used)}/{format_mb(memory.total)})<br>"
+                f"({format_mb(memory.used)} / {format_mb(memory.total)})\n"
                 f"• Disk: <code>{disk.percent}%</code> "
-                f"({format_mb(disk.used)}/{format_mb(disk.total)})<br>"
+                f"({format_mb(disk.used)} / {format_mb(disk.total)})\n"
                 f"• Uptime: <code>{format_timedelta(uptime)}</code>\n\n"
-    
-                f"<b>📈 Stats</b><br>"
-                f"• Anime: <code>{total_anime}</code><br>"
-                f"• Files: <code>{total_files}</code><br>"
-                f"• Episodes: <code>{total_episodes}</code><br>"
-                f"• Users: <code>{total_users}</code><br>"
-                f"• Premium Users: <code>{premium_users}</code><br>"
-                f"• Searches: <code>{stats.get('total_searches', 0)}</code><br>"
+            
+                f"<b>📈 Bot Statistics</b>\n"
+                f"• Total Anime: <code>{total_anime}</code>\n"
+                f"• Total Files: <code>{total_files}</code>\n"
+                f"• Episodes: <code>{total_episodes}</code>\n\n"
+                f"• Users: <code>{total_users}</code>\n"
+                f"• Premium Users: <code>{premium_users}</code>\n\n"
+                f"• Searches: <code>{stats.get('total_searches', 0)}</code>\n"
                 f"• Downloads: <code>{stats.get('total_downloads', 0)}</code>\n\n"
-    
-                f"<b>🗃️ Database Clusters</b><br>"
-                + "<br><br>".join(cluster_info) +
+            
+                f"<b>🗃️ Cluster Databases</b>\n"
+                + "\n\n".join(cluster_info) +
                 "\n\n"
-    
+            
                 f"{user_db_info}\n\n"
-    
-                f"<b>📊 Insert Distribution</b><br>"
-                + "<br>".join(cluster_dist)
+            
+                f"<b>📦 Insert Distribution</b>\n"
+                + "\n".join(cluster_dist)
             )
+
     
             sent_msg = await message.reply_text(
                 message_text,
