@@ -9,7 +9,7 @@ class Scripts(object):
 <b>•</b> <i>Browse the full anime collection</i><br>
 <b>•</b> <i>Download episodes in various quality options</i><br>
 <b>•</b> <i>Save shows to your personal watchlist</i><br>
-<b>•</b> <i>Track your ongoing and completed anime easily</i><br><br>
+<b>•</b> <i>Track your ongoing  anime easily</i><br><br>
 </blockquote>
 """
 
@@ -35,6 +35,7 @@ class Scripts(object):
 - /watchlist — View and manage your saved anime
 - /todayschedule — View today's anime release schedule
 - /request <anime name> — Request an anime to be added
+- /myplan - to see premium and max daily limit
 - /help — Show this help message
 
 📌 *Usage Tips:*
