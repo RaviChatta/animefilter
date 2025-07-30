@@ -5335,7 +5335,7 @@ class AnimeBot:
     async def get_episode_count(self, anime_id: int) -> int:
         anime = await self.db.find_anime(anime_id)
         return anime.get('episodes', 1)
-       async def show_anime_by_letter(self, client: Client, callback_query: CallbackQuery, letter: str, page: int = 1):
+    async def show_anime_by_letter(self, client: Client, callback_query: CallbackQuery, letter: str, page: int = 1):
         try:
             ITEMS_PER_PAGE = 8  # Number of items per page
             
