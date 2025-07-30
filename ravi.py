@@ -1293,17 +1293,17 @@ class AnimeBot:
             ])
 
             # Use a different picture for browse if available, or fallback to START_PIC
-            browse_pic = "https://files.catbox.moe/jj1u54.jpg"  # Replace with your actual browse picture URL
+            browse_pic = "https://files.catbox.moe/qqa869.jpg"  # Replace with your actual browse picture URL
             try:
                 await message.reply_photo(
                     photo=browse_pic,
-                    caption="📚 Browse Anime by Letter\n\nSelect a letter to browse anime:",
+                    caption="📚 Browse Anime by Letter\nSelect a letter to browse anime:",
                     reply_markup=InlineKeyboardMarkup(keyboard)
                 )
             except Exception:
                 # Fallback to text if photo fails
                 await message.reply_text(
-                    "📚 Browse Anime by Letter\n\nSelect a letter to browse anime:",
+                    "📚 Browse Anime by Letter\nSelect a letter to browse anime:",
                     reply_markup=InlineKeyboardMarkup(keyboard)
                 )
         except Exception as e:
@@ -1318,7 +1318,7 @@ class AnimeBot:
                 await message.reply_text(
                     "⭐ Your watchlist is empty.\nAdd anime to your watchlist from their details page.",
                     reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🔍 Search Anime", switch_inline_query_current_chat="")],
+                        
                         [InlineKeyboardButton("📜 Browse Anime", callback_data="available_anime")]
                     ]))
                 return
