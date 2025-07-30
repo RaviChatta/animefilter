@@ -4697,319 +4697,292 @@ class AnimeBot:
         if callback_query.from_user.id not in Config.ADMINS:
             await callback_query.answer("❌ Admin only", show_alert=True)
             return
-
+        
         try:
-            per_page = 10
+            ITEMS_PER_PAGE = 8
             all_anime = []
-
-            # Collect ALL anime from ALL clusters first
+            
+            # Search across all clusters
             for db_client in self.db.anime_clients:
                 try:
                     db = db_client[self.db.db_name]
-                    cursor = db.anime.find(
+                    cluster_anime = await db.anime.find(
                         {},
-                        {"id": 1, "title": 1, "episodes": 1, "is_sequel": 1, "prequel_id": 1, "sequel_id": 1}
-                    ).sort("title", 1)
-                    async for anime in cursor:
-                        all_anime.append(anime)
+                        {"id": 1, "title": 1, "episodes": 1, "is_sequel": 1}
+                    ).sort("title", 1).to_list(None)
+                    all_anime.extend(cluster_anime)
                 except Exception as e:
-                    logger.warning(f"Cluster error: {e}")
+                    logger.error(f"Error fetching anime from cluster: {e}")
                     continue
-
-            if not all_anime:
-                await callback_query.answer("❌ No anime found in database", show_alert=True)
-                return
-
-            # Remove duplicates by ID
+            
+            # Remove duplicates
             seen_ids = set()
             unique_anime = []
             for anime in all_anime:
-                if anime['id'] not in seen_ids:
-                    seen_ids.add(anime['id'])
-                    unique_anime.append(anime)
-
-            total_pages = (len(unique_anime) + per_page - 1) // per_page
-            page = max(1, min(page, total_pages))  # Clamp page to valid range
-
-            start_idx = (page - 1) * per_page
-            end_idx = start_idx + per_page
-            page_anime = unique_anime[start_idx:end_idx]
-
-            keyboard = []
-            for anime in page_anime:
-                title = anime.get('title', 'Untitled')
-                eps = anime.get('episodes', '?')
-                btn_text = f"{title} ({eps} eps)"
-
-                if anime.get('sequel_id'):
-                    btn_text += " 🔜"
-                if anime.get('prequel_id'):
-                    btn_text += " ⏮️"
-                if anime.get('is_sequel'):
-                    btn_text += " (Sequel)"
-
-                keyboard.append([
-                    InlineKeyboardButton(btn_text, callback_data=f"select_sequel_{anime['id']}")
-                ])
-
-            # Pagination controls (without the "Page x/y" button)
-            pagination = []
-            if page > 1:
-                pagination.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"link_sequel_page_{page-1}"))
-
-            if page < total_pages:
-                pagination.append(InlineKeyboardButton("Next ➡️", callback_data=f"link_sequel_page_{page+1}"))
-
-            if pagination:
-                keyboard.append(pagination)
-
-            # Back button
-            keyboard.append([self.get_back_button("admin")])
-
-            await self.update_message(
-                client,
-                callback_query.message,
-                f"🔗 <b>Select Anime to Link as Sequel</b>\n"
-                f"📋 Total Anime: <b>{len(unique_anime)}</b>",
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-
-        except Exception as e:
-            logger.error(f"Link sequel error: {e}")
-            await callback_query.answer("❌ Error loading anime list", show_alert=True)
-
-    async def select_sequel_anime(self, client: Client, callback_query: CallbackQuery):
-        if callback_query.from_user.id not in Config.ADMINS:
-            await callback_query.answer("You don't have permission to access this.", show_alert=True)
-            return
-        
-        sequel_id = int(callback_query.data.split('_')[-1])
-        
-        try:
-            # Search across all clusters for the anime
-            anime = None
-            for db_client in self.db.anime_clients:
-                try:
-                    db = client[self.db.db_name]
-                    found = await db.anime.find_one({"id": sequel_id}, {"title": 1, "is_sequel": 1})
-                    if found:
-                        anime = found
-                        break
-                except Exception as e:
-                    logger.warning(f"Error finding anime in cluster: {e}")
-            
-            if not anime:
-                await self.update_message(
-                    client,
-                    callback_query.message,
-                    "❌ *Anime not found!*"
-                )
-                return
-            
-            if anime.get('is_sequel'):
-                await self.update_message(
-                    client,
-                    callback_query.message,
-                    "⚠️ *This anime is already marked as a sequel!*\n"
-                    "Please select another anime."
-                )
-                return
-            
-            self.user_sessions[callback_query.from_user.id]['linking_sequel'] = {
-                'sequel_id': sequel_id,
-                'sequel_title': anime['title']
-            }
-            
-            # Search across all clusters for potential prequels
-            anime_list = []
-            for db_client in self.db.anime_clients:
-                try:
-                    db = client[self.db.db_name]
-                    cluster_results = await db.anime.find(
-                        {"id": {"$ne": sequel_id}},
-                        {"id": 1, "title": 1, "episodes": 1}
-                    ).sort("title", 1).limit(50).to_list(None)
-                    anime_list.extend(cluster_results)
-                except Exception as e:
-                    logger.warning(f"Error fetching anime from cluster: {e}")
-            
-            # Deduplicate
-            seen_ids = set()
-            unique_anime = []
-            for anime in anime_list:
                 if anime["id"] not in seen_ids:
                     seen_ids.add(anime["id"])
                     unique_anime.append(anime)
             
             if not unique_anime:
-                await self.update_message(
-                    client,
-                    callback_query.message,
-                    "ℹ️ *No other anime found in database!*"
-                )
+                await callback_query.answer("❌ No anime found in database", show_alert=True)
+                return
+            
+            # Pagination
+            total_pages = (len(unique_anime) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE
+            page = max(1, min(page, total_pages))
+            start_idx = (page - 1) * ITEMS_PER_PAGE
+            end_idx = start_idx + ITEMS_PER_PAGE
+            page_anime = unique_anime[start_idx:end_idx]
+
+            keyboard = []
+            for anime in page_anime:
+                btn_text = f"{anime['title']} ({anime.get('episodes', '?')} eps)"
+                if anime.get('is_sequel'):
+                    btn_text += " (Sequel)"
+                keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"select_sequel_{anime['id']}")])
+            
+            # Pagination buttons
+            nav_buttons = []
+            if page > 1:
+                nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"link_sequel_{page-1}"))
+            if page < total_pages:
+                nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"link_sequel_{page+1}"))
+            
+            if nav_buttons:
+                keyboard.append(nav_buttons)
+            
+            keyboard.append([
+                InlineKeyboardButton("🔙 Admin Panel", callback_data="admin_panel"),
+                InlineKeyboardButton("❌ Close", callback_data="close_message")
+            ])
+            
+            await callback_query.message.edit_text(
+                f"🔗 <b>Select Anime to Link as Sequel (Page {page}/{total_pages})</b>",
+                reply_markup=InlineKeyboardMarkup(keyboard))
+                
+        except Exception as e:
+            logger.error(f"Error in link_sequel_start: {e}")
+            await callback_query.answer("❌ Error loading anime list", show_alert=True)
+
+    async def select_sequel_anime(self, client: Client, callback_query: CallbackQuery, sequel_id: int):
+        try:
+            # Find the sequel anime across all clusters
+            sequel = None
+            for db_client in self.db.anime_clients:
+                try:
+                    db = db_client[self.db.db_name]
+                    found = await db.anime.find_one({"id": sequel_id})
+                    if found:
+                        sequel = found
+                        break
+                except Exception as e:
+                    logger.error(f"Error finding anime in cluster: {e}")
+                    continue
+            
+            if not sequel:
+                await callback_query.answer("❌ Anime not found", show_alert=True)
+                return
+            
+            if sequel.get('is_sequel'):
+                await callback_query.answer("⚠️ This anime is already a sequel!", show_alert=True)
+                return
+            
+            # Store in session
+            self.user_sessions[callback_query.from_user.id] = {
+                'linking_sequel': {
+                    'sequel_id': sequel_id,
+                    'sequel_title': sequel['title']
+                }
+            }
+            
+            # Now find potential prequels (all anime except this one)
+            all_anime = []
+            for db_client in self.db.anime_clients:
+                try:
+                    db = db_client[self.db.db_name]
+                    cluster_anime = await db.anime.find(
+                        {"id": {"$ne": sequel_id}},
+                        {"id": 1, "title": 1, "episodes": 1}
+                    ).sort("title", 1).limit(50).to_list(None)
+                    all_anime.extend(cluster_anime)
+                except Exception as e:
+                    logger.error(f"Error fetching anime from cluster: {e}")
+                    continue
+            
+            # Remove duplicates
+            seen_ids = set()
+            unique_anime = []
+            for anime in all_anime:
+                if anime["id"] not in seen_ids:
+                    seen_ids.add(anime["id"])
+                    unique_anime.append(anime)
+            
+            if not unique_anime:
+                await callback_query.answer("❌ No other anime found to link", show_alert=True)
                 return
             
             keyboard = []
-            for anime in unique_anime:
+            for anime in unique_anime[:50]:  # Limit to 50 to avoid too many buttons
                 btn_text = f"{anime['title']} ({anime.get('episodes', '?')} eps)"
                 keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"select_prequel_{anime['id']}")])
             
-            keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="admin_link_sequel")])
-            await self.update_message(
-                client,
-                callback_query.message,
-                f"🔗 *Link {anime['title']} as sequel to:*",
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
+            keyboard.append([
+                InlineKeyboardButton("🔙 Back", callback_data="link_sequel_1"),
+                InlineKeyboardButton("❌ Cancel", callback_data="admin_panel")
+            ])
+            
+            await callback_query.message.edit_text(
+                f"🔗 <b>Select Prequel for:</b> {sequel['title']}",
+                reply_markup=InlineKeyboardMarkup(keyboard))
+                
         except Exception as e:
-            logger.error(f"Error selecting sequel anime: {e}")
-            await callback_query.answer("Error selecting sequel anime.", show_alert=True)
+            logger.error(f"Error in select_sequel_anime: {e}")
+            await callback_query.answer("❌ Error selecting sequel", show_alert=True)
 
-    async def select_prequel_anime(self, client: Client, callback_query: CallbackQuery):
-        if callback_query.from_user.id not in Config.ADMINS:
-            await callback_query.answer("You don't have permission to access this.", show_alert=True)
-            return
-        
-        prequel_id = int(callback_query.data.split('_')[-1])
-        user_id = callback_query.from_user.id
-        
-        if user_id not in self.user_sessions or 'linking_sequel' not in self.user_sessions[user_id]:
-            await callback_query.answer("Session expired. Please start again.", show_alert=True)
-            return
-        
-        sequel_id = self.user_sessions[user_id]['linking_sequel']['sequel_id']
-        sequel_title = self.user_sessions[user_id]['linking_sequel']['sequel_title']
-        
+    async def select_prequel_anime(self, client: Client, callback_query: CallbackQuery, prequel_id: int):
         try:
+            user_id = callback_query.from_user.id
+            if user_id not in self.user_sessions or 'linking_sequel' not in self.user_sessions[user_id]:
+                await callback_query.answer("❌ Session expired", show_alert=True)
+                return
+            
+            sequel_id = self.user_sessions[user_id]['linking_sequel']['sequel_id']
+            sequel_title = self.user_sessions[user_id]['linking_sequel']['sequel_title']
+            
             # Find prequel across all clusters
             prequel = None
             for db_client in self.db.anime_clients:
                 try:
-                    db = client[self.db.db_name]
-                    found = await db.anime.find_one({"id": prequel_id}, {"title": 1})
+                    db = db_client[self.db.db_name]
+                    found = await db.anime.find_one({"id": prequel_id})
                     if found:
                         prequel = found
                         break
                 except Exception as e:
-                    logger.warning(f"Error finding prequel in cluster: {e}")
+                    logger.error(f"Error finding anime in cluster: {e}")
+                    continue
             
             if not prequel:
-                await self.update_message(
-                    client,
-                    callback_query.message,
-                    "❌ *Prequel anime not found!*"
-                )
+                await callback_query.answer("❌ Prequel not found", show_alert=True)
                 return
             
-            # Update both anime across all clusters
-            success = False
+            # Update both anime in all clusters
+            updated = False
             for db_client in self.db.anime_clients:
                 try:
-                    db = client[self.db.db_name]
+                    db = db_client[self.db.db_name]
                     # Update sequel
                     await db.anime.update_one(
                         {"id": sequel_id},
-                        {"$set": {"is_sequel": True, "prequel_id": prequel_id}}
+                        {"$set": {
+                            "prequel_id": prequel_id,
+                            "is_sequel": True
+                        }}
                     )
                     # Update prequel
                     await db.anime.update_one(
                         {"id": prequel_id},
                         {"$set": {"sequel_id": sequel_id}}
                     )
-                    success = True
+                    updated = True
                 except Exception as e:
-                    logger.warning(f"Error updating in cluster: {e}")
+                    logger.error(f"Error updating cluster: {e}")
+                    continue
             
-            if not success:
+            if not updated:
                 raise Exception("Failed to update any cluster")
             
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]
-            ])
-            
-            await self.update_message(
-                client,
-                callback_query.message,
-                f"✅ *Successfully linked sequels:*\n\n"
-                f"⏮️ *Prequel:* {prequel['title']}\n"
-                f"🔜 *Sequel:* {sequel_title}\n\n"
-                f"🆔 *Prequel ID:* `{prequel_id}`\n"
-                f"🆔 *Sequel ID:* `{sequel_id}`",
-                reply_markup=keyboard
-            )
-            
-            if user_id in self.user_sessions:
+            # Clear session
+            if user_id in self.user_sessions and 'linking_sequel' in self.user_sessions[user_id]:
                 del self.user_sessions[user_id]['linking_sequel']
+            
+            await callback_query.message.edit_text(
+                f"✅ <b>Successfully linked sequels:</b>\n\n"
+                f"⏮️ <b>Prequel:</b> {prequel['title']}\n"
+                f"🔜 <b>Sequel:</b> {sequel_title}\n\n"
+                f"🆔 <b>Prequel ID:</b> <code>{prequel_id}</code>\n"
+                f"🆔 <b>Sequel ID:</b> <code>{sequel_id}</code>",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Admin Panel", callback_data="admin_panel")]
+                ]))
+                
         except Exception as e:
-            logger.error(f"Error linking sequels: {e}")
-            await self.update_message(
-                client,
-                callback_query.message,
-                "❌ *Error linking sequels!*"
-            )
-
-    async def view_anime_ids(self, client: Client, callback_query: CallbackQuery):
+            logger.error(f"Error in select_prequel_anime: {e}")
+            await callback_query.answer("❌ Error linking sequels", show_alert=True)
+    async def view_anime_ids(self, client: Client, callback_query: CallbackQuery, page: int = 1):
         if callback_query.from_user.id not in Config.ADMINS:
-            await callback_query.answer("You don't have permission to access this.", show_alert=True)
+            await callback_query.answer("❌ Admin only", show_alert=True)
             return
         
         try:
-            # Search across all clusters for anime list
-            anime_list = []
+            ITEMS_PER_PAGE = 10
+            all_anime = []
+            
+            # Search across all clusters
             for db_client in self.db.anime_clients:
                 try:
-                    db = client[self.db.db_name]
-                    cluster_results = await db.anime.find(
+                    db = db_client[self.db.db_name]
+                    cluster_anime = await db.anime.find(
                         {},
                         {"id": 1, "title": 1, "episodes": 1, "is_sequel": 1, "prequel_id": 1, "sequel_id": 1}
-                    ).sort("title", 1).limit(50).to_list(None)
-                    anime_list.extend(cluster_results)
+                    ).sort("title", 1).to_list(None)
+                    all_anime.extend(cluster_anime)
                 except Exception as e:
-                    logger.warning(f"Error fetching anime from cluster: {e}")
+                    logger.error(f"Error fetching anime from cluster: {e}")
+                    continue
             
-            # Deduplicate
+            # Remove duplicates
             seen_ids = set()
             unique_anime = []
-            for anime in anime_list:
+            for anime in all_anime:
                 if anime["id"] not in seen_ids:
                     seen_ids.add(anime["id"])
                     unique_anime.append(anime)
             
             if not unique_anime:
-                await self.update_message(
-                    client,
-                    callback_query.message,
-                    "ℹ️ *No anime found in database!*"
-                )
+                await callback_query.answer("❌ No anime found in database", show_alert=True)
                 return
             
-            message = "🆔 *Anime IDs*\n\n"
-            for anime in unique_anime:
-                message += f"• *{anime['title']}* ({anime.get('episodes', '?')} eps)\n"
-                message += f"  🆔 `{anime['id']}`\n"
+            # Pagination
+            total_pages = (len(unique_anime) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE
+            page = max(1, min(page, total_pages))
+            start_idx = (page - 1) * ITEMS_PER_PAGE
+            end_idx = start_idx + ITEMS_PER_PAGE
+            page_anime = unique_anime[start_idx:end_idx]
+
+            message = "🆔 <b>Anime IDs</b>\n\n"
+            for anime in page_anime:
+                message += f"• <b>{anime['title']}</b> ({anime.get('episodes', '?')} eps)\n"
+                message += f"  🆔 <code>{anime['id']}</code>\n"
                 if anime.get('is_sequel'):
-                    message += f"  ⏮️ Prequel ID: `{anime.get('prequel_id', 'None')}`\n"
+                    message += f"  ⏮️ Prequel ID: <code>{anime.get('prequel_id', 'None')}</code>\n"
                 if anime.get('sequel_id'):
-                    message += f"  🔜 Sequel ID: `{anime.get('sequel_id', 'None')}`\n"
+                    message += f"  🔜 Sequel ID: <code>{anime.get('sequel_id', 'None')}</code>\n"
                 message += "\n"
             
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]
+            # Pagination buttons
+            keyboard = []
+            if page > 1:
+                keyboard.append([InlineKeyboardButton("⬅️ Previous", callback_data=f"view_ids_{page-1}")])
+            if page < total_pages:
+                if not keyboard:
+                    keyboard.append([])
+                keyboard[0].append(InlineKeyboardButton("Next ➡️", callback_data=f"view_ids_{page+1}"))
+            
+            keyboard.append([
+                InlineKeyboardButton("🔙 Admin Panel", callback_data="admin_panel"),
+                InlineKeyboardButton("❌ Close", callback_data="close_message")
             ])
             
             await self.update_message(
                 client,
                 callback_query.message,
                 message,
-                reply_markup=keyboard
-            )
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )    
         except Exception as e:
-            logger.error(f"Error fetching anime list: {e}")
-            await self.update_message(
-                client,
-                callback_query.message,
-                "❌ *Error fetching anime list!*"
-            )
+            logger.error(f"Error in view_anime_ids: {e}")
+            await callback_query.answer("❌ Error loading anime IDs", show_alert=True)
 
     async def show_anime_id(self, client: Client, callback_query: CallbackQuery, anime_id: int):
         try:
@@ -5361,20 +5334,22 @@ class AnimeBot:
     async def get_episode_count(self, anime_id: int) -> int:
         anime = await self.db.find_anime(anime_id)
         return anime.get('episodes', 1)
-    async def show_anime_by_letter(self, client: Client, callback_query: CallbackQuery, letter: str):
+       async def show_anime_by_letter(self, client: Client, callback_query: CallbackQuery, letter: str, page: int = 1):
         try:
+            ITEMS_PER_PAGE = 8  # Number of items per page
+            
             # Search across all clusters for anime starting with the letter
             anime_list = []
-            for db_client in self.db.anime_clients:  # This is the database client
+            for db_client in self.db.anime_clients:
                 try:
-                    db = db_client[self.db.db_name]  # Use db_client instead of client
+                    db = db_client[self.db.db_name]
                     cluster_results = await db.anime.find(
                         {"title": {"$regex": f"^{letter}", "$options": "i"}},
                         {"id": 1, "title": 1, "episodes": 1, "studio": 1}
-                    ).sort("title", 1).limit(50).to_list(None)
+                    ).sort("title", 1).to_list(None)
                     anime_list.extend(cluster_results)
                 except Exception as e:
-                    logger.warning(f"Error searching anime in cluster: {e}")
+                    logger.warning(f"Error searching anime in cluster {db_client}: {e}")
             
             # Deduplicate
             seen_ids = set()
@@ -5388,27 +5363,42 @@ class AnimeBot:
                 await callback_query.answer(f"No anime found starting with '{letter}'.", show_alert=True)
                 return
 
+            # Calculate pagination
+            total_pages = (len(unique_anime) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE
+            page = max(1, min(page, total_pages))  # Clamp page to valid range
+            start_idx = (page - 1) * ITEMS_PER_PAGE
+            end_idx = start_idx + ITEMS_PER_PAGE
+            page_anime = unique_anime[start_idx:end_idx]
+
             keyboard = []
-            for anime in unique_anime:
+            for anime in page_anime:
                 btn_text = f"{anime['title']} ({anime.get('episodes', '?')} eps)"
                 keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"anime_{anime['id']}")])
+
+            # Add pagination controls if needed
+            pagination_buttons = []
+            if page > 1:
+                pagination_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"letter_{letter}_{page-1}"))
+            if end_idx < len(unique_anime):
+                pagination_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"letter_{letter}_{page+1}"))
             
-            keyboard.append([InlineKeyboardButton("• ʙᴀᴄᴋ •", callback_data="available_anime")])
+            if pagination_buttons:
+                keyboard.append(pagination_buttons)
+
+            keyboard.append([
+                InlineKeyboardButton("🔙 Back to Letters", callback_data="available_anime"),
+                InlineKeyboardButton("❌ Close", callback_data="close_message")
+            ])
             
             await self.update_message(
                 client,
                 callback_query.message,
-                f"🌀 <b><u>Anime starting with '{letter}':</u></b>",
+                f"🌀 <b>Anime starting with '{letter}' (Page {page}/{total_pages}):</b>",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
         except Exception as e:
             logger.error(f"Error fetching anime by letter {letter}: {e}")
-            await callback_query.message.reply_text("⚠️ Error fetching anime list. Please try again.")
-
-
-    # Add this to your AnimeBot class
-    
-
+            await callback_query.answer("⚠️ Error fetching anime list. Please try again.", show_alert=True)
     async def today_schedule_command(self, client: Client, message: Message):
         """Show today's anime schedule with auto-delete"""
         try:
@@ -6046,20 +6036,30 @@ class AnimeBot:
             elif data.startswith("link_sequel_page_"):
                 page = int(data.split("_")[-1])
                 await self.link_sequel_start(client, callback_query, page)
-            
+          
             elif data.startswith("select_sequel_"):
-                await self.select_sequel_anime(client, callback_query)
+                sequel_id = int(data.split("_")[2])
+                await self.select_sequel_anime(client, callback_query, sequel_id)
                 
             elif data.startswith("select_prequel_"):
-                await self.select_prequel_anime(client, callback_query)
+                prequel_id = int(data.split("_")[2])
+                await self.select_prequel_anime(client, callback_query, prequel_id)
+                
+            elif data.startswith("link_sequel"):
+                page = int(data.split("_")[2]) if len(data.split("_")) > 2 else 1
+                await self.link_sequel_start(client, callback_query, page)
                 
             elif data == "admin_view_ids":
-                await self.view_anime_ids(client, callback_query)
-                
-            elif data.startswith("show_id_"):
-                anime_id = int(data.split("_")[2])
-                await self.show_anime_id(client, callback_query, anime_id)
-                
+                await self.view_anime_ids(client, callback_query, page=1)
+        
+            elif data.startswith("view_ids_"):
+                try:
+                    page = int(data.split("_")[2])
+                    await self.view_anime_ids(client, callback_query, page=page)
+                except Exception as e:
+                    logger.error(f"Error parsing view_ids page: {e}")
+                    await callback_query.answer("❌ Invalid page", show_alert=True)
+
             elif data == "admin_add_admin":
                 await self.add_admin_start(client, callback_query)
                 
