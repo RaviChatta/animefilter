@@ -6489,7 +6489,7 @@ async def main():
         help_text = Scripts.HELP_TEXT.format(
             bot_name=Config.BOT_NAME, 
             group_link=Config.GROUP_LINK,
-            delete_timer=Config.DELETE_TIMER_MINUTES
+            delete_timer=Config.DELETE_TIMER_MINUTES,
             developer_link=Config.DEVELOPER_USERNAME
         )
 
