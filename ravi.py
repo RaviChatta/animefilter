@@ -1017,9 +1017,9 @@ class AnimeBot:
             r'\(\s*S(\d+)\s*\)'
         ]
         self.language_patterns = [
-            r'\[(EN|ENG|JP|JAP|ES|FR|DE|HIN|TEL|SUB|DUB)\]',
-            r'\((EN|ENG|JP|JAP|ES|FR|DE|HIN|TEL|SUB|DUB)\)',
-            r'\{(EN|ENG|JP|JAP|ES|FR|DE|HIN|TEL|SUB|DUB)\}'
+            r'\[(?:EN|ENG|JP|JAP|ES|FR|DE|HIN|TEL|SUB|DUB|DUAL|MULTI)\]',
+            r'\((?:EN|ENG|JP|JAP|ES|FR|DE|HIN|TEL|SUB|DUB|DUAL|MULTI)\)',
+            r'\{(?:EN|ENG|JP|JAP|ES|FR|DE|HIN|TEL|SUB|DUB|DUAL|MULTI)\}'
         ]
 
     async def initialize(self):
@@ -5115,8 +5115,7 @@ class AnimeBot:
 
             keyboard = []
             for anime in results:
-                rating = self.format_rating(anime.get('score'))
-                btn_text = f"{anime['title']} ({anime.get('episodes', '?')} eps) {rating}"
+                btn_text = f"{anime['title']} ({anime.get('episodes', '?')} eps)"
                 keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"anime_{anime['id']}")])
 
             keyboard.append([
@@ -5145,20 +5144,6 @@ class AnimeBot:
             await message.reply_text("⚠️ Error processing search. Please try again.")
 
 
-    def format_rating(self, score: Optional[float]) -> str:
-        """Convert score (0-100) to 5-star rating with half stars"""
-        if score is None:
-            return ""
-        
-        stars = (score / 100) * 5
-        stars = min(5, max(0, stars))  # Clamp between 0-5
-        
-        full_stars = int(stars)
-        half_star = 1 if stars - full_stars >= 0.5 else 0
-        empty_stars = 5 - full_stars - half_star
-        
-        rating = "⭐" * full_stars + "✨" * half_star + "☆" * empty_stars
-        return f"{rating} ({stars:.1f}/5)"
     async def check_expiry_and_revoke(self):
         """Check and revoke expired premium access"""
         expired_users = []
@@ -5239,18 +5224,6 @@ class AnimeBot:
         if not date or not date.get('year'):
             return "N/A"
         return f"{date.get('day', '?')}/{date.get('month', '?')}/{date['year']}"
-
-    async def create_progress_bar(self, score: int) -> str:
-        """Create a star rating progress bar based on score (0-100)"""
-        if not score or score < 0 or score > 100:
-            return ""
-        
-        # Calculate filled and empty stars
-        filled_stars = round(score / 20)  # 5 stars total, each represents 20 points
-        empty_stars = 5 - filled_stars
-        
-        # Use different star characters for better visual appearance
-        return "⭐" * filled_stars + "☆" * empty_stars
 
     async def delete_message_after_delay(self, client: Client, chat_id: int, message_id: int, delay: int):
         await asyncio.sleep(delay)
@@ -5387,8 +5360,8 @@ class AnimeBot:
                 keyboard.append(pagination_buttons)
 
             keyboard.append([
-                InlineKeyboardButton("🔙 Back to Letters", callback_data="available_anime"),
-                InlineKeyboardButton("❌ Close", callback_data="close_message")
+                InlineKeyboardButton("• ʙᴀᴄᴋ •", callback_data="available_anime"),
+                InlineKeyboardButton("• ᴄʟᴏꜱᴇ •", callback_data="close_message")
             ])
             
             await self.update_message(
@@ -5542,7 +5515,7 @@ class AnimeBot:
                 else:
                     access_level = 1
                     
-            max_downloads = self.config.MAX_DAILY_DOWNLOADS.get(access_level, 24)
+            max_downloads = self.config.MAX_DAILY_DOWNLOADS.get(access_level, 30)
             
             # Unlimited downloads (-1 means unlimited)
             if max_downloads == -1:
@@ -5881,9 +5854,10 @@ class AnimeBot:
                 await self.show_anime_by_letter(client, callback_query, letter)
                 
             elif data.startswith("letter_"):
-                letter = data.split("_")[1]
-                await self.show_anime_by_letter(client, callback_query, letter)
-                
+                parts = callback_query.data.split("_")
+                letter = parts[1]
+                page = int(parts[2]) if len(parts) > 2 else 1
+                await self.show_anime_by_letter(client, callback_query, letter, page)
             elif data.startswith("anime_"):
                 anime_id = int(data.split("_")[1])
                 await self.show_anime_details(client, callback_query, anime_id)
