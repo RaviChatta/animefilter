@@ -1017,10 +1017,11 @@ class AnimeBot:
             r'\(\s*S(\d+)\s*\)'
         ]
         self.language_patterns = [
-            r'\[(?:EN|ENG|JP|JAP|ES|FR|DE|HIN|TEL|SUB|DUB|DUAL|MULTI)\]',
-            r'\((?:EN|ENG|JP|JAP|ES|FR|DE|HIN|TEL|SUB|DUB|DUAL|MULTI)\)',
-            r'\{(?:EN|ENG|JP|JAP|ES|FR|DE|HIN|TEL|SUB|DUB|DUAL|MULTI)\}'
+            r'\[(EN|ENG|JP|JAP|ES|FR|DE|HIN|TEL|SUB|DUB|DUAL|MULTI)\]',
+            r'\((EN|ENG|JP|JAP|ES|FR|DE|HIN|TEL|SUB|DUB|DUAL|MULTI)\)',
+            r'\{(EN|ENG|JP|JAP|ES|FR|DE|HIN|TEL|SUB|DUB|DUAL|MULTI)\}'
         ]
+
 
     async def initialize(self):
         await self.db.initialize()
