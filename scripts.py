@@ -53,7 +53,7 @@ class Scripts(object):
 
 🆘 *Need Help?*
 - Reach out to admins in our support group or ask your question there!
-- Developed by [R]({developer_link})
+- Developed by [RAVI]({developer_link})
 """
 
 
