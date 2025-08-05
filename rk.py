@@ -1448,27 +1448,33 @@ class AnimeBot:
         file_name = message.document.file_name if message.document else message.video.file_name if message.video else ""
         caption = message.caption or ""
         combined_text = f"{file_name} {caption}".lower()
-        
-        # First check if this is a movie/single-file type
+
+        # Normalize: remove brackets and extra spaces
+        combined_text = re.sub(r'[\[\](){}]', ' ', combined_text)
+        combined_text = re.sub(r'\s+', ' ', combined_text).strip()
+
+        # First check if this is a movie/single-file type from config
         type_info = Config.ANIME_TYPES.get(anime_type.upper(), {})
         if not type_info.get('has_episodes', True):
             return 1  # Default to episode 1 for non-episodic content
-        
-        # Movie detection patterns
+
+        # Movie detection patterns (expanded)
         movie_patterns = [
             r'\bmovie\b', r'\bfilm\b', r'complete movie', r'full movie',
-            r'劇場版', r'movie edition', r'feature film', r'\[movie\]',
-            r'\(movie\)', r'-\s*movie\s*-'
+            r'劇場版', r'movie edition', r'feature film',
+            r'\bs00\b',                              # Treat S00 as movie/special
+            r's\d+\s*[-~]?\s*movie',                 # S01 - Movie, S00-Movie
+            r'.*?\bmovie\b.*?',                      # any phrase with "movie"
         ]
-        
+
         # If any movie pattern matches, return episode 1
-        if any(re.search(pattern, combined_text) for pattern in movie_patterns):
+        if any(re.search(pattern, combined_text, re.IGNORECASE) for pattern in movie_patterns):
             return 1
 
-        # Enhanced episode patterns with priority
+        # Episode number patterns
         patterns = [
             r'\[S\d+\s*[-~]\s*E(\d+)\]',     # [S01-E13]
-            r'\bS\d+\s*[-~]\s*E(\d+)\b',     # S01 - E13 (no brackets)
+            r'\bS\d+\s*[-~]\s*E(\d+)\b',     # S01 - E13
             r'\[E(\d+)\]',                   # [E13]
             r'S\d+E(\d+)',                   # S01E13
             r'OVA\s*[-~]?\s*(\d{1,3})',      # OVA - 05
@@ -1483,7 +1489,7 @@ class AnimeBot:
             r'第(\d+)集'                     # Chinese notation
         ]
 
-        # Search in combined text
+        # Try matching episode numbers
         for pattern in patterns:
             match = re.search(pattern, combined_text, re.IGNORECASE)
             if match:
@@ -1491,13 +1497,12 @@ class AnimeBot:
                     return int(match.group(1))
                 except (ValueError, IndexError):
                     continue
-        
-        # Special case for season markers without episode
-        if re.search(r'S\d+', combined_text, re.IGNORECASE):
-            return 1
-            
-        return None  # Not found
 
+        # Special case: season markers but no episode number
+        if re.search(r'\bS\d+\b', combined_text, re.IGNORECASE):
+            return 1
+
+        return None  # Nothing matched
     async def send_formatted_message(client, chat_id, text, reply_markup=None):
         try:
             return await client.send_message(
