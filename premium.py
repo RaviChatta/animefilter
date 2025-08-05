@@ -14,7 +14,7 @@ from pyrogram.types import (
 from pyrogram.enums import ParseMode
 from dotenv import load_dotenv
 from settings import config
-from ravi import *
+from rk import *
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
