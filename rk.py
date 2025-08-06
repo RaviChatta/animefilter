@@ -6445,45 +6445,51 @@ class HealthCheckServer:
             await self.site.stop()
         if self.runner:
             await self.runner.cleanup()
+async def shutdown(stop_event):
+    """Cleanup tasks tied to the service's shutdown."""
+    print("Shutting down gracefully...")
+
+    # Signal all tasks to stop
+    stop_event.set()
+
+    # Close health server
+    await bot.stop_health_server()
+
+    # Close database connections
+    if hasattr(bot, 'db'):
+        for client in bot.db.anime_clients:
+            client.close()
+        if hasattr(bot.db, 'users_client'):
+            bot.db.users_client.close()
+
+    print("Cleanup complete")
+
+async def run_until_stopped(client: Client, stop_event: asyncio.Event):
+    """Run the client until stop event is set"""
+    try:
+        await client.start()
+        print("Bot started successfully")
+        await stop_event.wait()
+    finally:
+        if client.is_connected:
+            await client.stop()
+
 async def main():
     global bot
     bot = AnimeBot()
     await bot.initialize()
     await bot.db.load_admins_and_owners()
 
-    # Set up signal handlers
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
-    
+
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(
             sig,
             lambda: asyncio.create_task(shutdown(stop_event))
-    
-    async def shutdown(stop_event):
-        """Cleanup tasks tied to the service's shutdown."""
-        print("Shutting down gracefully...")
-        
-        # Signal all tasks to stop
-        stop_event.set()
-        
-        # Close health server
-        await bot.stop_health_server()
-        
-        # Close database connections
-        if hasattr(bot, 'db'):
-            for client in bot.db.anime_clients:
-                client.close()
-            if hasattr(bot.db, 'users_client'):
-                bot.db.users_client.close()
-        
-        print("Cleanup complete")
+        )
 
     try:
-        await bot.initialize()
-        await bot.db.load_admins_and_owners()
-        
-        # Start health server
         await bot.start_health_server()
 
         app = Client(
@@ -6502,32 +6508,18 @@ async def main():
             asyncio.create_task(run_until_stopped(app, stop_event))
         ]
 
-        # Wait for stop signal
-        await stop_event.wait()
-        
-        # Cancel all running tasks
+        await stop_event.wait()  # Wait for shutdown signal
+
         for task in tasks:
             task.cancel()
-        
-        # Wait for tasks to complete
         await asyncio.gather(*tasks, return_exceptions=True)
-        
+
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)
     finally:
         if 'app' in locals():
             await app.stop()
         print("Bot shutdown complete")
-
-    async def run_until_stopped(client: Client, stop_event: asyncio.Event):
-        """Run the client until stop event is set"""
-        try:
-            await client.start()
-            print("Bot started successfully")
-            await stop_event.wait()
-        finally:
-            if client.is_connected:
-                await client.stop()
     # Command handlers
     @app.on_message(filters.command("start") & (filters.private | (filters.group & filters.chat(Config.GROUP_ID) if Config.GROUP_ID else filters.group)))
     async def start_command(client: Client, message: Message):
