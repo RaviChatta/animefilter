@@ -6744,9 +6744,9 @@ async def main():
 
             # Handle session awaiting search
          # Check if user is awaiting search input
-            if user_id in self.user_sessions and self.user_sessions[user_id].get('awaiting_search'):
-                del self.user_sessions[user_id]['awaiting_search']
-                await self.process_search(client, message)
+            if user_id in bot.user_sessions and bot.user_sessions[user_id].get('awaiting_search'):
+                del bot.user_sessions[user_id]['awaiting_search']
+                await bot.process_search(client, message)
                 return
                 
 
@@ -6832,16 +6832,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
-
-
-
-
-
-
-
-
-
-    
-   
