@@ -9,7 +9,7 @@ from aiohttp import web
 from route import web_server
 from rk import *
 from dotenv import load_dotenv
-
+from settings import config
 load_dotenv()
 
 
@@ -30,7 +30,7 @@ async def start_services():
     bot = Bot()
     await bot.start()
 
-    if Config.WEBHOOK:
+    if config.WEBHOOK:
         app = web.AppRunner(await web_server())
         await app.setup()
         site = web.TCPSite(app, "0.0.0.0", 8080)
