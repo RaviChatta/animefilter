@@ -6922,12 +6922,6 @@ def register_handlers(app: Client):
             print(f"Inline query error: {e}")
             logger.error(f"Error handling inline query: {e}")
 
-    logger.info("Starting AnimeFilterBot...")
-    await app.start()
-    await idle()
-    await app.stop()
-
-
 
 
 if __name__ == "__main__":
