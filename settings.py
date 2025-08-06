@@ -14,6 +14,8 @@ class Settings:
     PROTECT_CONTENT = False
     RATE_LIMIT = 5  # messages per second
     OWNERS = list(map(int, os.getenv("OWNERS", "").split(","))) if os.getenv("OWNERS") else []
+    WEBHOOK = os.getenv("WEBHOOK", "True").lower() in ("true", "1", "yes")
+
 
 # Singleton instance
 config = Settings()
