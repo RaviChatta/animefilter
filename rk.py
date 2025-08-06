@@ -3,6 +3,7 @@ import sys
 import re
 import uuid
 import random
+import time 
 import html
 import logging
 import aiohttp
@@ -6922,7 +6923,6 @@ async def main():
 
 
 
-
 if __name__ == "__main__":
     # Configure logging
     logging.basicConfig(
@@ -6933,7 +6933,8 @@ if __name__ == "__main__":
             logging.FileHandler('bot.log')
         ]
     )
-    
+    logger = logging.getLogger(__name__)
+
     # Start the bot
     while True:
         try:
@@ -6943,12 +6944,7 @@ if __name__ == "__main__":
         except Exception as e:
             logger.error(f"Bot crashed: {e}", exc_info=True)
             logger.info("Restarting in 10 seconds...")
-            await asyncio.sleep(10)
-
-
-
-
-
+            time.sleep(10)  # Correct way to pause in a sync context
 
     
    
