@@ -10,6 +10,8 @@ import asyncio
 import json
 import base64
 import psutil
+import signal
+from aiohttp import web
 from typing import Dict, List, Optional, Tuple , Union
 from datetime import datetime, timedelta
 from pyrogram import Client as PyroClient
@@ -6374,6 +6376,14 @@ class AnimeBot:
                 await message.reply_text("⚠️ User not found or not an admin")
         except Exception as e:
             await message.reply_text(f"❌ Error: {str(e)}")
+    # Add these methods to your AnimeBot class
+    async def start_health_server(self):
+        self.health_server = HealthCheckServer()
+        await self.health_server.start()
+    
+    async def stop_health_server(self):
+        if hasattr(self, 'health_server'):
+            await self.health_server.stop()
 
   
 async def check_expiry_periodically():
@@ -6411,30 +6421,113 @@ async def check_available_periodically(client):
         except Exception as e:
             logger.error(f"Error in check_available_periodically: {e}")
             await asyncio.sleep(600)
-async def web_server():
-    app = web.Application()
-    app.router.add_get("/", lambda request: web.Response(text="Bot is running!"))
-    return app
-    
+
+class HealthCheckServer:
+    def __init__(self):
+        self.app = web.Application()
+        self.runner = None
+        self.site = None
+        self.port = 8000
+
+    async def health_check(self, request):
+        return web.Response(text="OK", status=200)
+
+    async def start(self):
+        self.app.add_routes([web.get('/healthz', self.health_check)])
+        self.runner = web.AppRunner(self.app)
+        await self.runner.setup()
+        self.site = web.TCPSite(self.runner, '0.0.0.0', self.port)
+        await self.site.start()
+        print(f"Health check server running on port {self.port}")
+
+    async def stop(self):
+        if self.site:
+            await self.site.stop()
+        if self.runner:
+            await self.runner.cleanup()
 async def main():
     global bot
     bot = AnimeBot()
     await bot.initialize()
     await bot.db.load_admins_and_owners()
 
-    app = Client(
-        "AnimeFilterBot",
-        api_id=Config.API_ID,
-        api_hash=Config.API_HASH,
-        bot_token=Config.BOT_TOKEN
-    )
+    # Set up signal handlers
+    loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
+    
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(
+            sig,
+            lambda: asyncio.create_task(shutdown(stop_event))
+    
+    async def shutdown(stop_event):
+        """Cleanup tasks tied to the service's shutdown."""
+        print("Shutting down gracefully...")
+        
+        # Signal all tasks to stop
+        stop_event.set()
+        
+        # Close health server
+        await bot.stop_health_server()
+        
+        # Close database connections
+        if hasattr(bot, 'db'):
+            for client in bot.db.anime_clients:
+                client.close()
+            if hasattr(bot.db, 'users_client'):
+                bot.db.users_client.close()
+        
+        print("Cleanup complete")
 
-    # Start background tasks
-    asyncio.create_task(check_expiry_periodically())
-    asyncio.create_task(check_session_timeouts())
-    asyncio.create_task(check_available_periodically(app))
-    asyncio.create_task(bot.daily_reset_task())
+    try:
+        await bot.initialize()
+        await bot.db.load_admins_and_owners()
+        
+        # Start health server
+        await bot.start_health_server()
 
+        app = Client(
+            "AnimeFilterBot",
+            api_id=Config.API_ID,
+            api_hash=Config.API_HASH,
+            bot_token=Config.BOT_TOKEN
+        )
+
+        # Start background tasks
+        tasks = [
+            asyncio.create_task(check_expiry_periodically()),
+            asyncio.create_task(check_session_timeouts()),
+            asyncio.create_task(check_available_periodically(app)),
+            asyncio.create_task(bot.daily_reset_task()),
+            asyncio.create_task(run_until_stopped(app, stop_event))
+        ]
+
+        # Wait for stop signal
+        await stop_event.wait()
+        
+        # Cancel all running tasks
+        for task in tasks:
+            task.cancel()
+        
+        # Wait for tasks to complete
+        await asyncio.gather(*tasks, return_exceptions=True)
+        
+    except Exception as e:
+        logger.error(f"Fatal error: {e}", exc_info=True)
+    finally:
+        if 'app' in locals():
+            await app.stop()
+        print("Bot shutdown complete")
+
+    async def run_until_stopped(client: Client, stop_event: asyncio.Event):
+        """Run the client until stop event is set"""
+        try:
+            await client.start()
+            print("Bot started successfully")
+            await stop_event.wait()
+        finally:
+            if client.is_connected:
+                await client.stop()
     # Command handlers
     @app.on_message(filters.command("start") & (filters.private | (filters.group & filters.chat(Config.GROUP_ID) if Config.GROUP_ID else filters.group)))
     async def start_command(client: Client, message: Message):
@@ -6835,27 +6928,30 @@ async def main():
     await idle()
     await app.stop()
 
-    # Start web server if needed (for webhooks or health checks)
-    runner = web.AppRunner(await web_server())
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", 8080)
-    await site.start()
-    logger.info("Web server started on port 8080")
-    
-    # Keep the bot running
-    await asyncio.Event().wait()
+
+
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
-    except Exception as e:
-        logger.error(f"Bot crashed: {e}")
-
-
-
-
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler('bot.log')
+        ]
+    )
+    
+    # Start the bot
+    while True:
+        try:
+            asyncio.run(main())
+        except KeyboardInterrupt:
+            break
+        except Exception as e:
+            logger.error(f"Bot crashed: {e}", exc_info=True)
+            logger.info("Restarting in 10 seconds...")
+            await asyncio.sleep(10)
 
 
 
