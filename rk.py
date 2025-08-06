@@ -16,6 +16,7 @@ from pyrogram import Client as PyroClient
 from motor.motor_asyncio import AsyncIOMotorClient
 from aiohttp import ClientSession, ClientTimeout
 from pyrogram.enums import ParseMode
+from aiohttp import web
 from pyrogram import Client, filters, enums
 from pyrogram.types import (
     InlineKeyboardButton, 
@@ -6410,7 +6411,11 @@ async def check_available_periodically(client):
         except Exception as e:
             logger.error(f"Error in check_available_periodically: {e}")
             await asyncio.sleep(600)
-
+async def web_server():
+    app = web.Application()
+    app.router.add_get("/", lambda request: web.Response(text="Bot is running!"))
+    return app
+    
 async def main():
     global bot
     bot = AnimeBot()
@@ -6830,9 +6835,23 @@ async def main():
     await idle()
     await app.stop()
 
-if __name__ == "__main__":
-    asyncio.run(main())
+    # Start web server if needed (for webhooks or health checks)
+    runner = web.AppRunner(await web_server())
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", 8080)
+    await site.start()
+    logger.info("Web server started on port 8080")
+    
+    # Keep the bot running
+    await asyncio.Event().wait()
 
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.error(f"Bot crashed: {e}")
 
 
 
