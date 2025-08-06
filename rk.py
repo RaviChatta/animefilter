@@ -6478,49 +6478,55 @@ async def run_until_stopped(client: Client, stop_event: asyncio.Event):
 async def main():
     global bot
     bot = AnimeBot()
+    
+    # Initialize everything first
     await bot.initialize()
     await bot.db.load_admins_and_owners()
 
-    loop = asyncio.get_running_loop()
-    stop_event = asyncio.Event()
+    # Start health server
+    await bot.start_health_server()
 
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(
-            sig,
-            lambda: asyncio.create_task(shutdown(stop_event))
-        )
+    # Create the Pyrogram client
+    app = Client(
+        "AnimeFilterBot",
+        api_id=Config.API_ID,
+        api_hash=Config.API_HASH,
+        bot_token=Config.BOT_TOKEN
+    )
+
+    # Register all handlers BEFORE starting the client
+    register_handlers(app)
 
     try:
-        await bot.start_health_server()
-
-        app = Client(
-            "AnimeFilterBot",
-            api_id=Config.API_ID,
-            api_hash=Config.API_HASH,
-            bot_token=Config.BOT_TOKEN
-        )
+        # Start the client
+        await app.start()
+        print("Bot started successfully")
 
         # Start background tasks
         tasks = [
             asyncio.create_task(check_expiry_periodically()),
             asyncio.create_task(check_session_timeouts()),
             asyncio.create_task(check_available_periodically(app)),
-            asyncio.create_task(bot.daily_reset_task()),
-            asyncio.create_task(run_until_stopped(app, stop_event))
+            asyncio.create_task(bot.daily_reset_task())
         ]
 
-        await stop_event.wait()  # Wait for shutdown signal
-
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        # Keep the bot running
+        while True:
+            await asyncio.sleep(3600)  # Sleep for 1 hour
 
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)
     finally:
-        if 'app' in locals():
-            await app.stop()
+        # Cleanup
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await app.stop()
+        await bot.stop_health_server()
         print("Bot shutdown complete")
+
+def register_handlers(app: Client):
+    """Register all message and callback handlers"""
     # Command handlers
     @app.on_message(filters.command("start") & (filters.private | (filters.group & filters.chat(Config.GROUP_ID) if Config.GROUP_ID else filters.group)))
     async def start_command(client: Client, message: Message):
@@ -6923,6 +6929,7 @@ async def main():
 
 
 
+
 if __name__ == "__main__":
     # Configure logging
     logging.basicConfig(
@@ -6933,9 +6940,8 @@ if __name__ == "__main__":
             logging.FileHandler('bot.log')
         ]
     )
-    logger = logging.getLogger(__name__)
-
-    # Start the bot
+    
+    # Start the bot with auto-restart
     while True:
         try:
             asyncio.run(main())
@@ -6944,7 +6950,4 @@ if __name__ == "__main__":
         except Exception as e:
             logger.error(f"Bot crashed: {e}", exc_info=True)
             logger.info("Restarting in 10 seconds...")
-            time.sleep(10)  # Correct way to pause in a sync context
-
-    
-   
+            time.sleep(10)
