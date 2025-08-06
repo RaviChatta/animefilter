@@ -1445,51 +1445,51 @@ class AnimeBot:
         return filename.strip()
     async def extract_episode_number(self, message: Message, anime_type: str) -> Optional[int]:
         # Get filename and caption
-        file_name = message.document.file_name if message.document else message.video.file_name if message.video else ""
+        file_name = (
+            message.document.file_name if message.document else
+            message.video.file_name if message.video else
+            ""
+        )
         caption = message.caption or ""
         combined_text = f"{file_name} {caption}".lower()
 
-        # Normalize: remove brackets and extra spaces
+        # Normalize brackets and whitespace
         combined_text = re.sub(r'[\[\](){}]', ' ', combined_text)
+        combined_text = re.sub(r'[-–—]', '-', combined_text)  # normalize dashes
         combined_text = re.sub(r'\s+', ' ', combined_text).strip()
 
-        # First check if this is a movie/single-file type from config
+        print(f"[DEBUG] Combined text: {combined_text}")  # 👈 DEBUG line
+
+        # Force treat as movie if filename/caption indicates it
+        if 'movie' in combined_text or '劇場版' in combined_text:
+            print("[DEBUG] Detected as movie")  # 👈 DEBUG line
+            return 1
+
+        # Get config
         type_info = Config.ANIME_TYPES.get(anime_type.upper(), {})
-        if not type_info.get('has_episodes', True):
-            return 1  # Default to episode 1 for non-episodic content
+        has_episodes = type_info.get('has_episodes', True)
 
-        # Movie detection patterns (expanded)
-        movie_patterns = [
-            r'\bmovie\b', r'\bfilm\b', r'complete movie', r'full movie',
-            r'劇場版', r'movie edition', r'feature film',
-            r'\bs00\b',                              # Treat S00 as movie/special
-            r's\d+\s*[-~]?\s*movie',                 # S01 - Movie, S00-Movie
-            r'.*?\bmovie\b.*?',                      # any phrase with "movie"
-        ]
-
-        # If any movie pattern matches, return episode 1
-        if any(re.search(pattern, combined_text, re.IGNORECASE) for pattern in movie_patterns):
+        if isinstance(has_episodes, bool) and not has_episodes:
             return 1
 
         # Episode number patterns
         patterns = [
-            r'\[S\d+\s*[-~]\s*E(\d+)\]',     # [S01-E13]
-            r'\bS\d+\s*[-~]\s*E(\d+)\b',     # S01 - E13
-            r'\[E(\d+)\]',                   # [E13]
-            r'S\d+E(\d+)',                   # S01E13
-            r'OVA\s*[-~]?\s*(\d{1,3})',      # OVA - 05
-            r'Episode\s*(\d+)',              # Episode 13
-            r'Ep\s*(\d+)',                   # Ep 13
-            r'-\s*(\d{2,3})\s*-',            # - 13 -
-            r'_\s*(\d{2,3})\s*_',            # _13_
-            r'\[\s*(\d+)\s*\]',              # [13]
-            r'\(\s*(\d+)\s*\)',              # (13)
-            r'\b(\d{2,3})\b',                # Standalone 13
-            r'第(\d+)話',                    # Japanese notation
-            r'第(\d+)集'                     # Chinese notation
+            r'\[S\d+\s*[-~]\s*E(\d+)\]',
+            r'\bS\d+\s*[-~]\s*E(\d+)\b',
+            r'\[E(\d+)\]',
+            r'S\d+E(\d+)',
+            r'OVA\s*[-~]?\s*(\d{1,3})',
+            r'Episode\s*(\d+)',
+            r'Ep\s*(\d+)',
+            r'-\s*(\d{2,3})\s*-',
+            r'_\s*(\d{2,3})\s*_',
+            r'\[\s*(\d+)\s*\]',
+            r'\(\s*(\d+)\s*\)',
+            r'\b(\d{2,3})\b',
+            r'第(\d+)話',
+            r'第(\d+)集'
         ]
 
-        # Try matching episode numbers
         for pattern in patterns:
             match = re.search(pattern, combined_text, re.IGNORECASE)
             if match:
@@ -1498,11 +1498,10 @@ class AnimeBot:
                 except (ValueError, IndexError):
                     continue
 
-        # Special case: season markers but no episode number
         if re.search(r'\bS\d+\b', combined_text, re.IGNORECASE):
             return 1
 
-        return None  # Nothing matched
+        return None  # fallback
     async def send_formatted_message(client, chat_id, text, reply_markup=None):
         try:
             return await client.send_message(
