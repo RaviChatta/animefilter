@@ -3,6 +3,7 @@ import sys
 import re
 import uuid
 import random
+import time 
 import html
 import logging
 import aiohttp
@@ -10,12 +11,16 @@ import asyncio
 import json
 import base64
 import psutil
-from typing import Dict, List, Optional, Tuple
+import signal
+from aiohttp import web
+from typing import Dict, List, Optional, Tuple , Union, Set
+from collections import defaultdict
 from datetime import datetime, timedelta
 from pyrogram import Client as PyroClient
 from motor.motor_asyncio import AsyncIOMotorClient
 from aiohttp import ClientSession, ClientTimeout
 from pyrogram.enums import ParseMode
+from aiohttp import web
 from pyrogram import Client, filters, enums
 from pyrogram.types import (
     InlineKeyboardButton, 
@@ -38,7 +43,8 @@ from dotenv import load_dotenv
 from bson import ObjectId
 from settings import config
 from scripts import Scripts
-
+from anime_quotes import AnimeQuotes
+from force_sub import ForceSub
 
 
 
@@ -63,6 +69,10 @@ class Database:
             os.getenv("PRIMARY_MONGO_URI"),
             os.getenv("SECONDARY_MONGO_URI"),
             os.getenv("TERTIARY_MONGO_URI"),
+            os.getenv("FOURTH_MONGO_URI"),
+            os.getenv("FIFTH_MONGO_URI"),
+            os.getenv("SIXTH_MONGO_URI"),
+            os.getenv("SEVENTH_MONG0_URI"),
             os.getenv("BACKUP_MONGO_URI")
         ]
         self.users_uri = os.getenv("USERS_MONGO_URI")
@@ -157,7 +167,7 @@ class Database:
                 continue
 
             try:
-                client = AsyncIOMotorClient(uri, serverSelectionTimeoutMS=5000)
+                client = AsyncIOMotorClient(uri, serverSelectionTimeoutMS=20000)  # 15 seconds
                 await client.admin.command("ping")
                 self.anime_clients.append(client)
                 self.cluster_status[i] = {
@@ -337,48 +347,91 @@ class Database:
                 await asyncio.sleep(1)
 
         return False
-    async def insert_file(self, file_data):
-        """Insert file into anime's cluster or fallback via round-robin"""
+    async def check_duplicate_file(self, file_data):
+        """Check for duplicate files across all clusters"""
         for i, client in enumerate(self.anime_clients):
             try:
+                if not hasattr(client, '__getitem__'):
+                    logger.error(f"Cluster {i} client is not subscriptable")
+                    continue
+                    
                 db = client[self.db_name]
-                anime_exists = await db.anime.count_documents({"id": file_data["anime_id"]}) > 0
-                if anime_exists:
-                    duplicate = await db.files.count_documents({
-                        "anime_id": file_data["anime_id"],
-                        "episode": file_data["episode"],
-                        "quality": file_data["quality"],
-                        "language": file_data.get("language")
-                    })
-                    if duplicate > 0:
-                        logger.info("Duplicate file detected, skipping")
-                        return False
+                query = {
+                    "anime_id": file_data["anime_id"],
+                    "episode": file_data["episode"],
+                    "quality": file_data["quality"]
+                }
+                # Only add language if it exists in file_data
+                if "language" in file_data:
+                    query["language"] = file_data["language"]
+                    
+                count = await db.files.count_documents(query)
+                if count > 0:
+                    return True
+            except Exception as e:
+                logger.warning(f"Error checking duplicates in cluster {i}: {str(e)[:200]}")
+        return False
 
+    async def insert_file(self, file_data):
+        """Insert file into anime's cluster or fallback via round-robin"""
+        # First check for duplicates globally
+        if await self.check_duplicate_file(file_data):
+            logger.info("Duplicate file detected, skipping")
+            return False
+
+        for i, client in enumerate(self.anime_clients):
+            try:
+                if not hasattr(client, '__getitem__'):
+                    logger.error(f"Cluster {i} client is not subscriptable")
+                    continue
+
+                db = client[self.db_name]
+                
+                # Check if anime exists in this cluster
+                anime_exists = await db.anime.count_documents({"id": file_data["anime_id"]}) > 0
+                
+                if anime_exists:
                     await db.files.insert_one(file_data)
                     logger.info(f"Inserted file into existing anime cluster {i}")
                     return True
             except Exception as e:
-                logger.warning(f"Cluster {i} check failed: {e}")
+                logger.warning(f"Cluster {i} operation failed: {str(e)[:200]}")
                 continue
 
-        # Anime not found — insert via round-robin
-        inserted = await self.insert_anime({
+        # Anime not found in any cluster - insert new anime first
+        anime_data = {
             "id": file_data["anime_id"],
             "title": file_data["anime_title"],
             "type": file_data.get("type", "TV"),
             "episodes": file_data.get("episodes", 1),
             "last_updated": datetime.now()
-        })
-
-        if inserted:
+        }
+        
+        if await self.insert_anime(anime_data):
+            # Retry file insertion after anime is inserted
             return await self.insert_file(file_data)
+        
         return False
-
+    async def update_anime(self, anime_id, update_data):
+        """Update anime across all clusters"""
+        updated = False
+        for client in self.anime_clients:  # Use consistent naming
+            try:
+                db = client[self.db_name]  # Use the same variable name
+                result = await db.anime.update_one(
+                    {"id": anime_id},
+                    {"$set": update_data}
+                )
+                if result.modified_count > 0:
+                    updated = True
+            except Exception as e:
+                logger.warning(f"Cluster update failed: {e}")
+        return updated
     async def find_anime(self, anime_id):
         """Search for an anime by ID across all clusters"""
-        for i, client in enumerate(self.anime_clients):
+        for i, db_client in enumerate(self.anime_clients):  # Use db_client
             try:
-                db = client[self.db_name]
+                db = db_client[self.db_name]  # Correct - using database client
                 anime = await db.anime.find_one({"id": anime_id})
                 if anime:
                     return anime
@@ -411,7 +464,7 @@ class Database:
                 return cluster_results
 
             except Exception as e:
-                logger.warning(f"Search error in cluster: {e}")
+                logger.warning(f"Search error in cluster (type={type(client)}): {e}")
                 return []
 
         # Launch search in all clusters in parallel
@@ -536,6 +589,39 @@ class Database:
             key=lambda x: self._parse_quality(x.get('quality', '')),
             reverse=True
         )
+    async def count_episodes(self, anime_id: int, count_unique=True):
+            """
+            Count episodes across all clusters
+            :param anime_id: Anime ID to count episodes for
+            :param count_unique: If True, counts unique episodes (ignores quality)
+                                If False, counts all files (including different qualities)
+            """
+            if count_unique:
+                # Count distinct episodes
+                pipeline = [
+                    {"$match": {"anime_id": anime_id}},
+                    {"$group": {"_id": "$episode"}},
+                    {"$count": "unique_episodes"}
+                ]
+            else:
+                # Count all files
+                pipeline = [
+                    {"$match": {"anime_id": anime_id}},
+                    {"$count": "total_files"}
+                ]
+
+            total = 0
+            for client in self.anime_clients:
+                try:
+                    db = client.get_database(self.db_name)  # Correct access method
+                    result = await db.files.aggregate(pipeline).to_list(1)
+                    if result and result[0].get('unique_episodes' if count_unique else 'total_files'):
+                        total += result[0]['unique_episodes' if count_unique else 'total_files']
+                except Exception as e:
+                    logger.warning(f"Error counting episodes in cluster: {e}")
+            return total
+
+   
 
     def _parse_quality(self, quality_str):
         """Helper to parse quality strings for sorting (360p -> 360, 720p -> 720 etc.)
@@ -673,6 +759,50 @@ class Database:
         except Exception as e:
             logger.error(f"Error getting database channels: {e}")
             return []
+    # In Database class
+    async def delete_episode(self, anime_id: int, episode: int = None, quality: str = None):
+        """Delete specific episode(s) from database"""
+        try:
+            query = {"anime_id": anime_id}
+            if episode is not None:
+                query["episode"] = episode
+            if quality is not None:
+                query["quality"] = quality.lower()
+            
+            deleted_count = 0
+            # Delete from all clusters
+            for client in self.anime_clients:
+                try:
+                    db = client[self.db_name]
+                    result = await db.files.delete_many(query)
+                    deleted_count += result.deleted_count
+                except Exception as e:
+                    logger.error(f"Error deleting from cluster: {e}")
+                    continue
+            
+            # Update anime episode count if needed
+            if episode and deleted_count > 0:
+                for client in self.anime_clients:
+                    try:
+                        db = client[self.db_name]
+                        # Get current max episode
+                        max_ep = await db.files.find(
+                            {"anime_id": anime_id},
+                            {"episode": 1}
+                        ).sort("episode", -1).limit(1).to_list(1)
+                        
+                        new_max = max_ep[0]["episode"] if max_ep else 0
+                        await db.anime.update_one(
+                            {"id": anime_id},
+                            {"$set": {"episodes": new_max}}
+                        )
+                    except Exception:
+                        continue
+            
+            return deleted_count
+        except Exception as e:
+            logger.error(f"Error deleting episodes: {e}")
+            return 0
     async def unlink_sequel(self, anime_id: int):
         """Remove sequel/prequel links for an anime"""
         try:
@@ -734,11 +864,12 @@ class Config:
     ADMINS = list(map(int, os.getenv("ADMINS", "").split(","))) if os.getenv("ADMINS") else []
     DATABASE_CHANNEL_ID = int(os.getenv("DATABASE_CHANNEL_ID", -1002448203068))
     GROUP_ID = int(os.getenv("GROUP_ID")) if os.getenv("GROUP_ID") else None
-    GROUP_LINK = os.getenv("GROUP_LINK", "https://t.me/yourgroup")
+    GROUP_LINK = os.getenv("GROUP_LINK", "https://t.me/TFIBOTS_SUPPORT")
     DELETE_TIMER_MINUTES = int(os.getenv("DELETE_TIMER_MINUTES", 1))
-    BOT_NAME = os.getenv("BOT_NAME", "A2ZBot")
+    BOT_NAME = os.getenv("BOT_NAME", "Anime Downloader Bot")
     MAX_EPISODES_PER_PAGE = 30
     MAX_SEARCH_RESULTS = 10
+    DEVELOPER_USERNAME = "https://t.me/sun_godnika_bot"
     MAX_BATCH_FILES = 100
     PM_SEARCH = os.getenv("PM_SEARCH", "True") == "True"
     PROTECT_CONTENT = os.getenv("PROTECT_CONTENT", "False") == "True"
@@ -790,19 +921,124 @@ class Config:
     ADULT_CONTENT_TYPES = ['ADULT', 'HENTAI']
 
 async def encode(string: str) -> str:
-    string_bytes = string.encode("ascii")
+    string_bytes = string.encode("utf-8")  # ✅ utf-8 supports all chars
     base64_bytes = base64.urlsafe_b64encode(string_bytes)
-    return base64_bytes.decode("ascii")
+    return base64_bytes.decode("utf-8")
 
 async def decode(base64_string: str) -> str:
-    base64_bytes = base64_string.encode("ascii")
+    base64_bytes = base64_string.encode("utf-8")
     string_bytes = base64.urlsafe_b64decode(base64_bytes)
-    return string_bytes.decode("ascii")
-
+    return string_bytes.decode("utf-8")
+# Add this class definition near your other class definitions
+# Add these imports at the top of your file
+# Add this class definition near your other class definitions
+class NotificationManager:
+    def __init__(self, bot_instance):
+        self.bot_instance = bot_instance  # Reference to the main bot instance
+        self.pending_notifications = defaultdict(lambda: defaultdict(set))  # anime_id -> episode -> set(user_ids)
+        self.notification_lock = asyncio.Lock()
+        self.processing_task = None
+        
+    async def start(self):
+        """Start the notification processing task"""
+        self.processing_task = asyncio.create_task(self.process_notifications_periodically())
+        
+    async def stop(self):
+        """Stop the notification processing task"""
+        if self.processing_task:
+            self.processing_task.cancel()
+            try:
+                await self.processing_task
+            except asyncio.CancelledError:
+                pass
+    
+    async def add_notification(self, anime_id: int, episode: int, user_id: int):
+        """Add a user to be notified about a new episode"""
+        async with self.notification_lock:
+            self.pending_notifications[anime_id][episode].add(user_id)
+    
+    async def process_notifications_periodically(self):
+        """Periodically process notifications with a cooldown"""
+        while True:
+            await asyncio.sleep(60)  # Process every minute
+            await self.process_notifications()
+    
+    async def process_notifications(self):
+        """Process all pending notifications"""
+        if not self.pending_notifications:
+            return
+            
+        async with self.notification_lock:
+            # Create a copy and clear the notifications
+            notifications_to_send = dict(self.pending_notifications)
+            self.pending_notifications.clear()
+        
+        # Process notifications for each anime and episode
+        for anime_id, episodes in notifications_to_send.items():
+            for episode, user_ids in episodes.items():
+                if user_ids:  # Only process if there are users to notify
+                    await self.send_bulk_notification(anime_id, episode, user_ids)
+    
+    async def send_bulk_notification(self, anime_id: int, episode: int, user_ids: Set[int]):
+        """Send a notification to multiple users about a new episode"""
+        try:
+            # Get anime details
+            anime = await self.bot_instance.db.find_anime(anime_id)
+            if not anime:
+                return
+                
+            # Get available qualities for this episode
+            files = await self.bot_instance.db.find_files(anime_id, episode)
+            qualities = set()
+            for file in files:
+                if 'quality' in file:
+                    qualities.add(file['quality'].upper())
+            
+            # Prepare the notification message
+            quality_text = f" [{', '.join(sorted(qualities))}]" if qualities else ""
+            message = (
+                f"📢 **New Episode Available!**\n\n"
+                f"🎬 **{anime.get('title', 'Unknown Anime')}**\n"
+                f"📺 **Episode {episode}**{quality_text}\n\n"
+                f"Use /watchlist to view your saved anime or "
+                f"search for \"{anime.get('title', '')}\" to watch now!"
+            )
+            
+            # Send notifications to all users with a semaphore to limit concurrency
+            semaphore = asyncio.Semaphore(10)  # Limit to 10 concurrent sends
+            
+            async def send_single_notification(user_id):
+                async with semaphore:
+                    try:
+                        # Use the Pyrogram client directly from the bot instance
+                        await self.bot_instance.app.send_message(
+                            chat_id=user_id,
+                            text=message,
+                            parse_mode=enums.ParseMode.MARKDOWN
+                        )
+                        # Small delay to avoid flooding
+                        await asyncio.sleep(0.1)
+                    except Exception as e:
+                        if "blocked" not in str(e).lower() and "deactivated" not in str(e).lower():
+                            logger.warning(f"Failed to send notification to {user_id}: {e}")
+            
+            # Create all tasks
+            tasks = [send_single_notification(user_id) for user_id in user_ids]
+            
+            # Wait for all tasks to complete with a timeout
+            await asyncio.gather(*tasks, return_exceptions=True)
+            
+            logger.info(f"Sent episode {episode} notifications for {anime['title']} to {len(user_ids)} users")
+            
+        except Exception as e:
+            logger.error(f"Error in bulk notification: {e}")
 class AnimeBot:
     def __init__(self):
         self.config = Config()
         self.db = Database()
+        self.notification_manager = NotificationManager(self)
+        self.app = None  # We'll set this when the client starts
+        self.force_sub = ForceSub(self.db, self)  # Pass self as bot_instance
         self.broadcast = Broadcast(self.db, self.config)
         self.request_system = RequestSystem(self)
         self.user_sessions = {}
@@ -810,6 +1046,7 @@ class AnimeBot:
         self.file_lists = {}
         self.rate_limit = {}
         self.premium = Premium(self.db, self.config, self)
+        self.quotes = AnimeQuotes(self)  # No initialize needed here
 
         self.settings = {
             'delete_timer': {
@@ -890,14 +1127,90 @@ class AnimeBot:
             r'\(\s*S(\d+)\s*\)'
         ]
         self.language_patterns = [
-            r'\[(EN|ENG|JP|JAP|ES|FR|DE|HIN|TEL|SUB|DUB)\]',
-            r'\((EN|ENG|JP|JAP|ES|FR|DE|HIN|TEL|SUB|DUB)\)',
-            r'\{(EN|ENG|JP|JAP|ES|FR|DE|HIN|TEL|SUB|DUB)\}'
+            r'\[(EN|ENG|JP|JAP|ES|FR|DE|HIN|TEL|SUB|DUB|DUAL|MULTI)\]',
+            r'\((EN|ENG|JP|JAP|ES|FR|DE|HIN|TEL|SUB|DUB|DUAL|MULTI)\)',
+            r'\{(EN|ENG|JP|JAP|ES|FR|DE|HIN|TEL|SUB|DUB|DUAL|MULTI)\}'
         ]
 
-    async def initialize(self):
+
+    async def initialize(self, app=None):
+        if app:
+            self.app = app  # Store the Pyrogram client
         await self.db.initialize()
+        await self.force_sub.initialize()  # Add this line
+        await self.notification_manager.start() # Start notification processing
         asyncio.create_task(self.premium.validate_cache_periodically())
+    def get_user_session(self, user_id: int, message_id: int = None):
+        """Get user session data with automatic cleanup"""
+        now = datetime.now()
+        
+        # First clean up expired sessions
+        expired_keys = []
+        for key, session in self.user_sessions.items():
+            if isinstance(key, int):  # User ID based session
+                last_active = session.get('last_active')
+                if last_active and (now - last_active).total_seconds() > 300:  # 5 minutes
+                    expired_keys.append(key)
+            elif isinstance(key, tuple):  # Message ID based session
+                last_active = session.get('last_active')
+                if last_active and (now - last_active).total_seconds() > 300:
+                    expired_keys.append(key)
+        
+        for key in expired_keys:
+            del self.user_sessions[key]
+        
+        # Now get the requested session
+        if message_id:
+            return self.user_sessions.get((user_id, message_id), {}).get('data', {})
+        return self.user_sessions.get(user_id, {})
+
+    def set_user_session(self, user_id: int, data: dict, message_id: int = None):
+        data['last_active'] = datetime.now()
+
+        if message_id:
+            self.user_sessions[message_id] = {
+                'data': data,
+                'original_user': user_id,
+                'last_active': datetime.now()
+            }
+        else:
+            self.user_sessions[user_id] = data
+
+    def clear_user_session(self, user_id: int, message_id: int = None):
+        """Clear user session"""
+        if message_id:
+            if (user_id, message_id) in self.user_sessions:
+                del self.user_sessions[(user_id, message_id)]
+        elif user_id in self.user_sessions:
+            del self.user_sessions[user_id]
+
+    async def session_cleanup_task(self):
+        while True:
+            now = datetime.now()
+            expired_keys = []
+
+            for key, session in self.user_sessions.items():
+                last_active = session.get('last_active')
+                if last_active and (now - last_active).total_seconds() > 300:
+                    expired_keys.append(key)
+
+            for key in expired_keys:
+                try:
+                    original_user = self.user_sessions[key].get('original_user')
+                    if original_user:
+                        try:
+                            await self.bot.send_message(
+                                chat_id=original_user,
+                                text="⌛ Your session has expired due to inactivity. Please start again."
+                            )
+                        except:
+                            pass
+                    del self.user_sessions[key]
+                except Exception as e:
+                    logger.error(f"Error cleaning session {key}: {e}")
+
+            await asyncio.sleep(60)
+
 
     async def check_rate_limit(self, user_id: int, chat_id: int = None) -> bool:
         key = f"{user_id}:{chat_id}" if chat_id else str(user_id)
@@ -920,123 +1233,180 @@ class AnimeBot:
 
     async def update_stats(self, stat_type: str, increment: int = 1):
         await self.db.update_stats(stat_type, increment)
-
+    async def count_total_episodes(self, count_unique=True):
+        total = 0
+        if not hasattr(self.db, 'anime_clients') or not self.db.anime_clients:
+            logger.warning("No anime_clients available in Database instance")
+            return 0
+            
+        for client in self.db.anime_clients:
+            try:
+                db = client[self.db.db_name]  # Use subscription syntax
+                if count_unique:
+                    pipeline = [
+                        {"$group": {"_id": "$episode"}},
+                        {"$count": "unique_episodes"}
+                    ]
+                else:
+                    pipeline = [{"$count": "total_files"}]
+                    
+                result = await db.files.aggregate(pipeline).to_list(1)
+                if result and result[0].get('unique_episodes' if count_unique else 'total_files'):
+                    total += result[0]['unique_episodes' if count_unique else 'total_files']
+            except Exception as e:
+                logger.warning(f"Error counting episodes in cluster: {e}")
+        return total
     async def status_command(self, client: Client, message: Message):
         """Enhanced status command with clean metrics and robust formatting"""
         try:
+            from datetime import datetime, timedelta
+            import psutil
+            import asyncio
+    
+            def format_timedelta(td: timedelta) -> str:
+                days = td.days
+                hours, remainder = divmod(td.seconds, 3600)
+                minutes, seconds = divmod(remainder, 60)
+                return f"{days}d {hours}h {minutes}m {seconds}s"
+    
+            def format_mb(bytes_value):
+                return f"{bytes_value / 1024 / 1024:.2f}MB"
+    
+            async def get_uptime() -> timedelta:
+                try:
+                    with open('/proc/uptime', 'r') as f:
+                        uptime_seconds = float(f.readline().split()[0])
+                    return timedelta(seconds=int(uptime_seconds))
+                except Exception:
+                    return datetime.now() - datetime.fromtimestamp(psutil.boot_time())
+    
             # 🖥️ System info
             memory = psutil.virtual_memory()
             disk = psutil.disk_usage('/')
-            cpu_percent = psutil.cpu_percent()
-            uptime = datetime.now() - datetime.fromtimestamp(psutil.boot_time())
-
+            cpu_percent = psutil.cpu_percent(interval=0.5)
+            uptime = await get_uptime()
+    
             # 👥 User stats
             stats = await self.db.stats_collection.find_one({"type": "global"}) or {}
             total_users = await self.db.users_collection.count_documents({})
-            premium_users = await self.db.premium_users.count_documents({"expiry_date": {"$gt": datetime.now()}})
-
+            premium_users = await self.db.premium_users.count_documents({
+                "expiry_date": {"$gt": datetime.now()}
+            })
+    
             # 📦 Cluster stats
             cluster_info = []
             total_anime = 0
             total_files = 0
-
-            for i, cluster_client in enumerate(self.db.anime_clients):
-                try:
-                    db = cluster_client[self.db.db_name]
-                    anime_count = await db.anime.estimated_document_count()
-                    files_count = await db.files.estimated_document_count()
-                    total_anime += anime_count
-                    total_files += files_count
-
-                    db_stats = await db.command("dbStats")
-                    data_size_mb = db_stats.get('dataSize', 0) / (1024 * 1024)
-                    index_size_mb = db_stats.get('indexSize', 0) / (1024 * 1024)
-
-                    cluster_info.append(
-                        f"🔹 *Cluster {i}*\n"
-                        f"   - Status: ✅ Online\n"
-                        f"   - Anime: `{anime_count}`\n"
-                        f"   - Files: `{files_count}`\n"
-                        f"   - Data Size: `{data_size_mb:.2f} MB`\n"
-                        f"   - Index Size: `{index_size_mb:.2f} MB`"
-                    )
-                except Exception as e:
-                    cluster_info.append(
-                        f"🔹 *Cluster {i}*\n"
-                        f"   - Status: ❌ Offline\n"
-                        f"   - Error: `{str(e)[:100]}`"
-                    )
-
+    
+            if not hasattr(self.db, 'anime_clients') or not self.db.anime_clients:
+                cluster_info.append("🔹 No database clusters configured or initialized")
+            else:
+                for i, cluster_client in enumerate(self.db.anime_clients):
+                    try:
+                        db = cluster_client[self.db.db_name]
+                        anime_count = await db.anime.estimated_document_count()
+                        files_count = await db.files.estimated_document_count()
+                        total_anime += anime_count
+                        total_files += files_count
+    
+                        db_stats = await db.command("dbStats")
+                        data_size_mb = db_stats.get('dataSize', 0) / (1024 * 1024)
+                        index_size_mb = db_stats.get('indexSize', 0) / (1024 * 1024)
+    
+                        cluster_info.append(
+                            f"🔹 <b>Cluster {i}</b><br>"
+                            f"   • Status: ✅ Online<br>"
+                            f"   • Anime: <code>{anime_count}</code><br>"
+                            f"   • Files: <code>{files_count}</code><br>"
+                            f"   • Data Size: <code>{data_size_mb:.2f} MB</code><br>"
+                            f"   • Index Size: <code>{index_size_mb:.2f} MB</code>"
+                        )
+                    except Exception as e:
+                        cluster_info.append(
+                            f"🔹 <b>Cluster {i}</b><br>"
+                            f"   • Status: ❌ Offline<br>"
+                            f"   • Error: <code>{str(e)[:100]}</code>"
+                        )
+    
+            total_episodes = await self.count_total_episodes(count_unique=True)
+    
             # 👤 User DB status
             try:
                 user_stats = await self.db.users_client[self.db.db_name].command("dbStats")
                 user_data_size = user_stats.get('dataSize', 0) / (1024 * 1024)
                 user_index_size = user_stats.get('indexSize', 0) / (1024 * 1024)
-
+    
                 user_db_info = (
-                    f"👤 *Users Database*\n"
-                    f"   - Status: ✅ Online\n"
-                    f"   - Users: `{total_users}`\n"
-                    f"   - Premium: `{premium_users}`\n"
-                    f"   - Data Size: `{user_data_size:.2f} MB`\n"
-                    f"   - Index Size: `{user_index_size:.2f} MB`"
+                    f"👤 <b>Users Database</b><br>"
+                    f"   • Status: ✅ Online<br>"
+                    f"   • Users: <code>{total_users}</code><br>"
+                    f"   • Premium: <code>{premium_users}</code><br>"
+                    f"   • Data Size: <code>{user_data_size:.2f} MB</code><br>"
+                    f"   • Index Size: <code>{user_index_size:.2f} MB</code>"
                 )
             except Exception as e:
                 user_db_info = (
-                    f"👤 *Users Database*\n"
-                    f"   - Status: ❌ Offline\n"
-                    f"   - Error: `{str(e)[:100]}`"
+                    f"👤 <b>Users Database</b><br>"
+                    f"   • Status: ❌ Offline<br>"
+                    f"   • Error: <code>{str(e)[:100]}</code>"
                 )
-
+    
             # 📊 Insert distribution
-            insert_stats = self.db.insert_stats or {}
+            insert_stats = getattr(self.db, 'insert_stats', {})
             total_inserts = insert_stats.get('total_inserts', 0)
             cluster_counts = insert_stats.get('cluster_counts', {})
-            cluster_dist = [
-                f"🔹 Cluster {i}: {count} inserts ({(count / total_inserts) * 100:.1f}%)"
-                for i, count in cluster_counts.items()
-            ] if total_inserts > 0 else ["No insert activity yet."]
-
+    
+            if total_inserts > 0:
+                cluster_dist = [
+                    f"🔹 Cluster {i}: <code>{count}</code> inserts "
+                    f"({(count / total_inserts) * 100:.1f}%)"
+                    for i, count in cluster_counts.items()
+                ]
+            else:
+                cluster_dist = ["No insert activity yet."]
+    
             # 📄 Final message
             message_text = (
-                f"📊 *{Config.BOT_NAME} Status*\n\n"
-                f"🖥️ *System*\n"
-                f"• CPU: `{cpu_percent}%`\n"
-                f"• Memory: `{memory.percent}%` ({memory.used / 1024 / 1024:.0f}MB/{memory.total / 1024 / 1024:.0f}MB)\n"
-                f"• Disk: `{disk.percent}%` ({disk.used / 1024 / 1024:.0f}MB/{disk.total / 1024 / 1024:.0f}MB)\n"
-                f"• Uptime: `{str(uptime).split('.')[0]}`\n\n"
-
-                f"📈 *Stats*\n"
-                f"• Anime: `{total_anime}`\n"
-                f"• Files: `{total_files}`\n"
-                f"• Users: `{total_users}`\n"
-                f"• Premium Users: `{premium_users}`\n"
-                f"• Searches: `{stats.get('total_searches', 0)}`\n"
-                f"• Downloads: `{stats.get('total_downloads', 0)}`\n\n"
-
-                f"🗃️ *Database Clusters*\n" +
-                "\n\n".join(cluster_info) + "\n\n" +
-                user_db_info + "\n\n" +
-                "📊 *Insert Distribution*\n" +
-                "\n".join(cluster_dist)
+                f"<b>📊 {Config.BOT_NAME} Status</b>\n\n"
+            
+                f"<b>🖥️ System Info</b>\n"
+                f"• CPU Usage: <code>{cpu_percent}%</code>\n"
+                f"• Memory: <code>{memory.percent}%</code> "
+                f"({format_mb(memory.used)} / {format_mb(memory.total)})\n"
+                f"• Disk: <code>{disk.percent}%</code> "
+                f"({format_mb(disk.used)} / {format_mb(disk.total)})\n"
+                f"• Uptime: <code>{format_timedelta(uptime)}</code>\n\n"
+            
+                f"<b>📈 Bot Statistics</b>\n"
+                f"• Total Anime: <code>{total_anime}</code>\n"
+                f"• Total Files: <code>{total_files}</code>\n"
+                f"• Episodes: <code>{total_episodes}</code>\n\n"
+                f"• Users: <code>{total_users}</code>\n"
+                f"• Premium Users: <code>{premium_users}</code>\n\n"
+                f"• Searches: <code>{stats.get('total_searches', 0)}</code>\n"
+                f"• Downloads: <code>{stats.get('total_downloads', 0)}</code>\n\n"
+            
+                f"<b>🗃️ Cluster Databases</b>\n"
+                + "\n\n".join(cluster_info) +
+                "\n\n"
+            
+                f"{user_db_info}\n\n"
+            
+                f"<b>📦 Insert Distribution</b>\n"
+                + "\n".join(cluster_dist)
             )
 
-            # ⌨️ Admin buttons
-            keyboard = []
-            if message.from_user.id in Config.ADMINS:
-                keyboard.append([
-                    InlineKeyboardButton("🔄 Refresh", callback_data="admin_status"),
-                    InlineKeyboardButton("⚙️ Settings", callback_data="admin_settings")
-                ])
-
-            await message.reply_text(
+    
+            sent_msg = await message.reply_text(
                 message_text,
-                parse_mode=enums.ParseMode.MARKDOWN,
-                reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None
+                parse_mode=enums.ParseMode.HTML,
+                disable_web_page_preview=True
             )
-
+            await asyncio.sleep(120)
+            await sent_msg.delete()
+    
         except Exception as e:
-            logger.error(f"Status command error: {e}")
+            logger.error(f"Status command error: {e}", exc_info=True)
             await message.reply_text("⚠️ Error retrieving status information.")
 
     async def get_anime_title(self, anime_id: int) -> str:
@@ -1110,17 +1480,17 @@ class AnimeBot:
             ])
 
             # Use a different picture for browse if available, or fallback to START_PIC
-            browse_pic = "https://files.catbox.moe/jj1u54.jpg"  # Replace with your actual browse picture URL
+            browse_pic = "https://files.catbox.moe/qqa869.jpg"  # Replace with your actual browse picture URL
             try:
                 await message.reply_photo(
                     photo=browse_pic,
-                    caption="📚 Browse Anime by Letter\n\nSelect a letter to browse anime:",
+                    caption="📚 Browse Anime by Letter\nSelect a letter to browse anime:",
                     reply_markup=InlineKeyboardMarkup(keyboard)
                 )
             except Exception:
                 # Fallback to text if photo fails
                 await message.reply_text(
-                    "📚 Browse Anime by Letter\n\nSelect a letter to browse anime:",
+                    "📚 Browse Anime by Letter\nSelect a letter to browse anime:",
                     reply_markup=InlineKeyboardMarkup(keyboard)
                 )
         except Exception as e:
@@ -1135,7 +1505,7 @@ class AnimeBot:
                 await message.reply_text(
                     "⭐ Your watchlist is empty.\nAdd anime to your watchlist from their details page.",
                     reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🔍 Search Anime", switch_inline_query_current_chat="")],
+                        
                         [InlineKeyboardButton("📜 Browse Anime", callback_data="available_anime")]
                     ]))
                 return
@@ -1178,11 +1548,6 @@ class AnimeBot:
         except Exception as e:
             logger.error(f"Error in watchlist command: {e}")
             await message.reply_text("⚠️ Error loading your watchlist. Please try again.")
-    async def clear_user_session(self, user_id: int):
-        """Clear all session data for a user"""
-        if user_id in self.user_sessions:
-            del self.user_sessions[user_id]
-
     def clean_filename(filename):
         """Clean and normalize filename for better parsing"""
         # Remove release group tags
@@ -1197,27 +1562,33 @@ class AnimeBot:
         file_name = message.document.file_name if message.document else message.video.file_name if message.video else ""
         caption = message.caption or ""
         combined_text = f"{file_name} {caption}".lower()
-        
-        # First check if this is a movie/single-file type
+
+        # Normalize: remove brackets and extra spaces
+        combined_text = re.sub(r'[\[\](){}]', ' ', combined_text)
+        combined_text = re.sub(r'\s+', ' ', combined_text).strip()
+
+        # First check if this is a movie/single-file type from config
         type_info = Config.ANIME_TYPES.get(anime_type.upper(), {})
         if not type_info.get('has_episodes', True):
             return 1  # Default to episode 1 for non-episodic content
-        
-        # Movie detection patterns
+
+        # Movie detection patterns (expanded)
         movie_patterns = [
             r'\bmovie\b', r'\bfilm\b', r'complete movie', r'full movie',
-            r'劇場版', r'movie edition', r'feature film', r'\[movie\]',
-            r'\(movie\)', r'-\s*movie\s*-'
+            r'劇場版', r'movie edition', r'feature film',
+            r'\bs00\b',                              # Treat S00 as movie/special
+            r's\d+\s*[-~]?\s*movie',                 # S01 - Movie, S00-Movie
+            r'.*?\bmovie\b.*?',                      # any phrase with "movie"
         ]
-        
+
         # If any movie pattern matches, return episode 1
-        if any(re.search(pattern, combined_text) for pattern in movie_patterns):
+        if any(re.search(pattern, combined_text, re.IGNORECASE) for pattern in movie_patterns):
             return 1
 
-        # Enhanced episode patterns with priority
+        # Episode number patterns
         patterns = [
             r'\[S\d+\s*[-~]\s*E(\d+)\]',     # [S01-E13]
-            r'\bS\d+\s*[-~]\s*E(\d+)\b',     # S01 - E13 (no brackets)
+            r'\bS\d+\s*[-~]\s*E(\d+)\b',     # S01 - E13
             r'\[E(\d+)\]',                   # [E13]
             r'S\d+E(\d+)',                   # S01E13
             r'OVA\s*[-~]?\s*(\d{1,3})',      # OVA - 05
@@ -1232,7 +1603,7 @@ class AnimeBot:
             r'第(\d+)集'                     # Chinese notation
         ]
 
-        # Search in combined text
+        # Try matching episode numbers
         for pattern in patterns:
             match = re.search(pattern, combined_text, re.IGNORECASE)
             if match:
@@ -1240,13 +1611,12 @@ class AnimeBot:
                     return int(match.group(1))
                 except (ValueError, IndexError):
                     continue
-        
-        # Special case for season markers without episode
-        if re.search(r'S\d+', combined_text, re.IGNORECASE):
-            return 1
-            
-        return None  # Not found
 
+        # Special case: season markers but no episode number
+        if re.search(r'\bS\d+\b', combined_text, re.IGNORECASE):
+            return 1
+
+        return None  # Nothing matched
     async def send_formatted_message(client, chat_id, text, reply_markup=None):
         try:
             return await client.send_message(
@@ -1264,6 +1634,14 @@ class AnimeBot:
                 reply_markup=reply_markup
             )
     async def start(self, client: Client, message: Message):
+        user_id = message.from_user.id
+        # Force subscription check - MUST be at the VERY BEGINNING
+        if self.force_sub.force_sub_enabled and self.force_sub.force_sub_channels:
+            if not await self.force_sub.check_member(client, user_id):
+                force_sub_msg, keyboard = await self.force_sub.get_force_sub_message(client)
+                await message.reply_text(force_sub_msg, reply_markup=keyboard)
+                return
+
         args = message.text.split(" ", 1)
         if len(args) > 1:
             try:
@@ -1333,7 +1711,7 @@ class AnimeBot:
 
         keyboard = InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("📢 ᴜᴘᴅᴀᴛᴇꜱ", url="https://t.me/yourchannel")
+                InlineKeyboardButton("📢 ᴜᴘᴅᴀᴛᴇꜱ", url="https://t.me/TFIBOTS")
             ],
             [
                 InlineKeyboardButton("📜 ʙʀᴏᴡꜱᴇ ᴀɴɪᴍᴇ", callback_data="available_anime"),
@@ -1439,101 +1817,6 @@ class AnimeBot:
         except Exception as e:
             logger.error(f"Error toggling watchlist: {e}")
             await callback_query.answer("Error updating watchlist.", show_alert=True)
-
-    async def show_recent_updates(self, client: Client, callback_query: CallbackQuery, page: int = 0):
-        try:
-            ITEMS_PER_PAGE = 10
-            results = []
-            
-            # Search across all clusters for recently updated anime
-            for db_client in self.db.anime_clients:
-                try:
-                    db = db_client[self.db.db_name]
-                    cluster_results = await db.anime.find(
-                        {},
-                        {"id": 1, "title": 1, "episodes": 1, "last_updated": 1, "status": 1}
-                    ).sort("last_updated", -1).limit(100).to_list(None)
-                    results.extend(cluster_results)
-                except Exception as e:
-                    logger.warning(f"Error fetching recent anime from cluster: {e}")
-                    continue
-            
-            # Deduplicate and sort
-            seen_ids = set()
-            unique_anime = []
-            for anime in results:
-                if anime["id"] not in seen_ids:
-                    seen_ids.add(anime["id"])
-                    unique_anime.append(anime)
-            
-            if not unique_anime:
-                await callback_query.answer("No recently updated anime found.", show_alert=True)
-                return
-            
-            # Sort by last_updated
-            unique_anime.sort(key=lambda x: x.get("last_updated", datetime.min), reverse=True)
-            
-            # Calculate pagination
-            total_pages = (len(unique_anime) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE
-            page = max(0, min(page, total_pages - 1))
-            start_idx = page * ITEMS_PER_PAGE
-            end_idx = start_idx + ITEMS_PER_PAGE
-            page_anime = unique_anime[start_idx:end_idx]
-            
-            keyboard = []
-            for anime in page_anime:
-                status_indicator = ""
-                if anime.get('status', '').upper() == "RELEASING":
-                    status_indicator = "🔄 "
-                
-                btn_text = f"{status_indicator}{anime['title']} ({anime.get('episodes', '?')} eps)"
-                keyboard.append([
-                    InlineKeyboardButton(btn_text, callback_data=f"anime_{anime['id']}")
-                ])
-            
-            # Pagination buttons
-            pagination = []
-            if page > 0:
-                pagination.append(InlineKeyboardButton("⬅️", callback_data=f"recent_page_{page-1}"))
-            if page < total_pages - 1:
-                pagination.append(InlineKeyboardButton("➡️", callback_data=f"recent_page_{page+1}"))
-            if pagination:
-                keyboard.append(pagination)
-            
-            keyboard.append([
-                InlineKeyboardButton("🔙 Back", callback_data="start_menu"),
-                InlineKeyboardButton("❌ Close", callback_data="close_message")
-            ])
-            
-            # Try to edit the message first
-            try:
-                await callback_query.message.edit_text(
-                    f"🔄 Recently Updated Anime (Page {page+1}/{total_pages})\n\n"
-                    "🔄 = Currently releasing new episodes\n"
-                    "Select an anime to view details:",
-                    reply_markup=InlineKeyboardMarkup(keyboard)
-                )
-            except Exception as e:
-                logger.warning(f"Error editing message, sending new: {e}")
-                # If editing fails, send a new message
-                await client.send_message(
-                    chat_id=callback_query.from_user.id,
-                    text=f"🔄 Recently Updated Anime (Page {page+1}/{total_pages})\n\n"
-                        "🔄 = Currently releasing new episodes\n"
-                        "Select an anime to view details:",
-                    reply_markup=InlineKeyboardMarkup(keyboard)
-                )
-                # Try to delete the old message
-                try:
-                    await callback_query.message.delete()
-                except:
-                    pass
-            
-            await callback_query.answer()
-        except Exception as e:
-            logger.error(f"Error showing recent updates: {e}")
-            await callback_query.answer("Error showing recent updates.", show_alert=True)
-
     async def show_anime_details(self, client: Client, callback_query: CallbackQuery, anime_id: int):
         try:
             user_id = callback_query.from_user.id
@@ -1612,21 +1895,7 @@ class AnimeBot:
             # ✅ Episode display
             ep_text = ""
             if type_info.get('has_episodes'):
-                total_uploaded = 0
-                for db_client in self.db.anime_clients:
-                    try:
-                        db = client[self.db.db_name]
-                        pipeline = [
-                            {"$match": {"anime_id": anime_id}},
-                            {"$group": {"_id": "$episode"}},
-                            {"$count": "total_episodes"}
-                        ]
-                        result = await db.files.aggregate(pipeline).to_list(1)
-                        if result and 'total_episodes' in result[0]:
-                            total_uploaded += result[0]['total_episodes']
-                    except Exception as e:
-                        logger.warning(f"Error counting episodes: {e}")
-                        continue
+                total_uploaded = await self.db.count_episodes(anime_id, count_unique=True)
 
                 # ✅ Only add (uploaded/total) if status is RELEASING
                 if anime.get('status', '').strip().upper() == 'RELEASING':
@@ -1670,15 +1939,12 @@ class AnimeBot:
 
       
             buttons = []
-
             if prequel:
                 buttons.append([
                     InlineKeyboardButton("🧩 ᴘʀᴇQᴜᴇʟ ", callback_data=f"anime_{prequel['id']}")
                 ])
-
             buttons.append([
                 InlineKeyboardButton("👀 ᴡᴀᴛᴄʜ ɴᴏᴡ", callback_data=watch_callback)
-              #  InlineKeyboardButton("📊 More Info", url=anime.get('url', "https://anilist.co"))
             ])
 
             in_watchlist = await self.db.is_in_watchlist(user_id, anime_id)
@@ -1692,6 +1958,15 @@ class AnimeBot:
                     InlineKeyboardButton("🎥 ꜱᴇQᴜᴇʟ " , callback_data=f"anime_{sequel['id']}")
                 ])
 
+            # Add Delete Episodes and Add Episodes buttons for admins
+            if user_id in Config.ADMINS:
+                buttons.append([
+                    InlineKeyboardButton("🗑️ Delete Episodes", callback_data=f"del_menu_{anime_id}")
+                ])
+                buttons.append([
+                    InlineKeyboardButton("📁 Add Episodes", callback_data=f"admin_add_episodes_{anime_id}")
+                ])
+
             buttons.append([
                 InlineKeyboardButton("🧭 ʙᴀᴄᴋ", callback_data="available_anime"),
                 InlineKeyboardButton("• ᴄʟᴏꜱᴇ •", callback_data="close_message")
@@ -1703,6 +1978,7 @@ class AnimeBot:
                     InlineKeyboardButton("🗑️ Delete", callback_data=f"admin_delete_anime_{anime_id}"),
                     InlineKeyboardButton("🆔 ID", callback_data=f"show_id_{anime_id}")
                 ])
+
 
             keyboard = InlineKeyboardMarkup(buttons)
             cover_url = anime.get('cover_url', Config.COVER_PIC)
@@ -1842,9 +2118,39 @@ class AnimeBot:
     async def process_bulk_download(self, client: Client, callback_query: CallbackQuery, anime_id: int, quality: str):
         """Handle bulk download with proper restrictions"""
         user_id = callback_query.from_user.id
+          # Force sub check
+        if not await check_force_sub(client, user_id, callback_query.message):
+            return
         
         try:
-            # Check adult content restrictions first
+            # First check if user has started the bot in PM
+            try:
+                user_chat = await client.get_chat(user_id)
+                if not user_chat or user_chat.type != ChatType.PRIVATE:
+                    raise Exception("User not started bot in PM")
+            except Exception as pm_error:
+                await callback_query.answer(
+                    "⚠️ Please start me in PM first to receive files!",
+                    show_alert=True
+                )
+                # Optionally send a message with start button
+                start_button = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("Start Bot", url=f"https://t.me/{client.me.username}?start=start")
+                ]])
+                await callback_query.message.reply_text(
+                    "Please start me in private chat to download files:",
+                    reply_markup=start_button
+                )
+                return
+
+            # Check download limits FIRST if premium mode is ON
+            if self.config.PREMIUM_MODE:
+                can_download, limit_msg = await self.check_download_limit(user_id)
+                if not can_download:
+                    await callback_query.answer(limit_msg, show_alert=True)
+                    return
+            
+            # Then check adult content restrictions
             anime = await self.db.find_anime(anime_id)
             if not anime:
                 await callback_query.answer("Anime not found.", show_alert=True)
@@ -1865,13 +2171,6 @@ class AnimeBot:
                             show_alert=True
                         )
                         return
-            
-            # Check download limits if premium mode is ON
-            if self.config.PREMIUM_MODE:
-                can_download, limit_msg = await self.check_download_limit(user_id)
-                if not can_download:
-                    await callback_query.answer(limit_msg, show_alert=True)
-                    return
             
             # Get all files for this anime and quality
             all_files = []
@@ -1962,7 +2261,11 @@ class AnimeBot:
                         # Update stats
                         await self.update_stats("total_downloads")
                         success_count += 1
-                        
+                        await self.db.users_collection.update_one(
+                            {"user_id": user_id},
+                            {"$inc": {"download_count": 1}}
+                        )
+
                         # Small delay between sends
                         await asyncio.sleep(0.5)
 
@@ -1981,32 +2284,35 @@ class AnimeBot:
                 await processing_msg.delete()
                 
                 result_msg = (
-                    f"✅ Successfully sent {success_count}/{len(all_files)} episodes!\n"
-                    f"⚠️ Files will auto-delete in {Config.DELETE_TIMER_MINUTES} minute(s)."
+                    f"<blockquote>\n"
+                    f"Successfully sent {success_count}/{len(all_files)} episodes!<br>\n"
+                    f"Files will auto-delete in {Config.DELETE_TIMER_MINUTES} minute(s).\n"
+                    f"</blockquote>"
                 )
-                
+
                 if errors:
                     result_msg += f"\n\nFailed episodes: {', '.join(errors[:10])}" + ("..." if len(errors) > 10 else "")
                 
+                # Always send the result to PM
+                await client.send_message(
+                    chat_id=user_id,
+                    text=result_msg
+                )
+                
+                # If the command was used in a group, show alert
                 if callback_query.message.chat.type != ChatType.PRIVATE:
                     await callback_query.answer(
                         f"📤 Sent {success_count}/{len(all_files)} episodes to your PM!",
                         show_alert=True
                     )
-                    await client.send_message(
-                        chat_id=user_id,
-                        text=result_msg
-                    )
-                else:
-                    await callback_query.message.reply_text(result_msg)
 
             except Exception as final_error:
                 logger.error(f"Error sending final message: {str(final_error)}")
 
         except Exception as main_error:
             logger.critical(f"Bulk download failed: {str(main_error)}")
-            await callback_query.answer("❌ Failed to process bulk download", show_alert=True)
-                
+            await callback_query.answer("❌ Failed to process bulk download", show_alert=True)   
+
     async def show_episode_options(self, client: Client, callback_query: CallbackQuery, anime_id: int, episode: int):
         user_id = callback_query.from_user.id
         if user_id not in self.user_sessions or 'current_anime' not in self.user_sessions[user_id]:
@@ -2068,7 +2374,7 @@ class AnimeBot:
             )
         except Exception as e:
             logger.error(f"Error fetching episode files: {e}")
-            await callback_query.answer("⚠️ Error fetching files.", show_alert=True)
+            await callback_query.answer("⚠️ Error fetching files.", show_alert=True)   
     async def process_file_download(self, client: Client, message: Message, file_id: str):
         """Handle file downloads with proper restrictions and error handling"""
         user_id = message.from_user.id
@@ -2163,7 +2469,11 @@ class AnimeBot:
                 sent_file_msg = await send_file(user_id)
                 warning_msg = await client.send_message(
                     chat_id=user_id,
-                    text=f"⚠️ This file will auto-delete in {Config.DELETE_TIMER_MINUTES} minute(s).",
+                    text = f"""
+                        <blockquote>
+                        ⚠️ This file will auto-delete in {Config.DELETE_TIMER_MINUTES} minute(s).
+                        </blockquote>
+                        """,
                     parse_mode=enums.ParseMode.HTML
                 )
 
@@ -2196,6 +2506,11 @@ class AnimeBot:
             asyncio.create_task(delete_messages())
 
             # Update stats
+            await self.db.users_collection.update_one(
+                {"user_id": user_id},
+                {"$inc": {"download_count": 1}}
+            )
+
             await self.update_stats("total_downloads")
 
         except Exception as main_error:
@@ -2206,7 +2521,9 @@ class AnimeBot:
     async def download_episode_file(self, client: Client, callback_query: CallbackQuery, file_id: str):
         """Handle file downloads from callback queries"""
         user_id = callback_query.from_user.id
-        
+        # Force sub check
+        if not await check_force_sub(client, user_id, callback_query.message):
+            return
         try:
             # Handle bulk download requests
             if file_id.startswith("bulk_"):
@@ -2305,7 +2622,11 @@ class AnimeBot:
 
                     warning_msg = await client.send_message(
                         chat_id=user_id,
-                        text=f"⚠️ File auto-deletes in {Config.DELETE_TIMER_MINUTES} minute(s).",
+                        text = f"""
+                        <blockquote>
+                        ⚠️ This file will auto-delete in {Config.DELETE_TIMER_MINUTES} minute(s).
+                        </blockquote>
+                        """,
                         parse_mode=enums.ParseMode.HTML
                     )
 
@@ -2331,7 +2652,11 @@ class AnimeBot:
 
                     warning_msg = await client.send_message(
                         chat_id=callback_query.message.chat.id,
-                        text=f"⚠️ File auto-deletes in {Config.DELETE_TIMER_MINUTES} minute(s).",
+                        text = f"""
+                        <blockquote>
+                        ⚠️ This file will auto-delete in {Config.DELETE_TIMER_MINUTES} minute(s).
+                        </blockquote>
+                        """,
                         parse_mode=enums.ParseMode.HTML
                     )
 
@@ -2347,6 +2672,11 @@ class AnimeBot:
                 asyncio.create_task(delete_messages())
 
                 # Update stats
+                await self.db.users_collection.update_one(
+                    {"user_id": user_id},
+                    {"$inc": {"download_count": 1}}
+                )
+
                 await self.update_stats("total_downloads")
 
             except Exception as e:
@@ -2370,7 +2700,7 @@ class AnimeBot:
                     cluster_results = await db.anime.find(
                         {"status": "RELEASING"},
                         {"id": 1, "title": 1, "episodes": 1, "last_updated": 1}
-                    ).sort("last_updated", -1).to_list(None)  # Sort by last updated (newest first)
+                    ).sort("last_updated", -1).to_list(None)
                     releasing_anime.extend(cluster_results)
                 except Exception as e:
                     logger.warning(f"Error fetching releasing anime from cluster: {e}")
@@ -2398,21 +2728,16 @@ class AnimeBot:
             # Create keyboard buttons
             keyboard = []
             for anime in page_anime:
-                # Get total uploaded episodes
-                total_uploaded = 0
-                for db_client in self.db.anime_clients:
-                    try:
-                        db = client[self.db.db_name]
-                        count = await db.files.count_documents({"anime_id": anime["id"]})
-                        total_uploaded += count
-                    except Exception:
-                        continue
-                
+                try:
+                    total_uploaded = await self.db.count_episodes(anime["id"], count_unique=True)
+                except Exception as e:
+                    logger.warning(f"Error counting episodes for anime {anime['id']}: {e}")
+                    total_uploaded = 0
+
                 btn_text = f"{anime['title']} ({total_uploaded}/{anime.get('episodes', '?')})"
                 keyboard.append([
                     InlineKeyboardButton(btn_text, callback_data=f"anime_{anime['id']}")
                 ])
-
             # Pagination controls
             pagination_buttons = []
             if page > 1:
@@ -2436,18 +2761,19 @@ class AnimeBot:
                 await self.update_message(
                     client,
                     message.message,
-                    f"🔄 Currently Releasing Anime (Page {page}/{total_pages}):\n\n"
-                    "Numbers show uploaded/total episodes\n"
-                    "Select an anime to view details:",
+                    f"<blockquote>🔄 Currently Releasing Anime (Page {page}/{total_pages}):</blockquote>\n"
+                    f"<blockquote>Numbers show uploaded/total episodes</blockquote>\n"
+                    f"<blockquote>Select an anime to view details:</blockquote>",
                     reply_markup=InlineKeyboardMarkup(keyboard)
                 )
             else:
                 await message.reply_text(
-                    f"🔄 Currently Releasing Anime (Page {page}/{total_pages}):\n\n"
-                    "Numbers show uploaded/total episodes\n"
-                    "Select an anime to view details:",
+                    f"<blockquote>🔄 Currently Releasing Anime (Page {page}/{total_pages}):</blockquote>\n"
+                    f"<blockquote>Numbers show uploaded/total episodes</blockquote>\n"
+                    f"<blockquote>Select an anime to view details:</blockquote>",
                     reply_markup=InlineKeyboardMarkup(keyboard)
                 )
+
 
         except Exception as e:
             logger.error(f"Error in ongoing_command: {e}")
@@ -2484,7 +2810,9 @@ class AnimeBot:
                     InlineKeyboardButton("🗑 Remove DB Channel", callback_data="admin_remove_db_channel")
                 ],
                 [
-                    InlineKeyboardButton("📮 View Requests", callback_data="requests_page:1")
+                    InlineKeyboardButton("📮 View Requests", callback_data="requests_page:1"),
+                    InlineKeyboardButton("📢 Force Subscription", callback_data="force_sub_settings")
+
                 ],
                 [
                     InlineKeyboardButton("🔗 Link Sequel", callback_data="admin_link_sequel"),
@@ -2524,7 +2852,10 @@ class AnimeBot:
             message += "⚠️ These actions are powerful and irreversible!\n\n"
             message += f"Current Owners: {len(Config.OWNERS)}\n"
             message += f"Current Admins: {len(Config.ADMINS)}\n"
-
+            message += f"To unlink sequals use /unlinksequel\n"
+            message += f"use /restart to restart bot \n"
+            message += f"use /setlimit to set limits \n"
+            
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("👑 Add Owner", callback_data="owner_add"),
                  InlineKeyboardButton("🚫 Remove Owner", callback_data="owner_remove")],
@@ -2535,8 +2866,8 @@ class AnimeBot:
                 [InlineKeyboardButton("📜 List Owners", callback_data="list_owners"),
                  InlineKeyboardButton("👥 List Admins", callback_data="owner_list_admins")],
 
-                [InlineKeyboardButton("📨 Rate Limit", callback_data="set_rate_limit"),
-                 InlineKeyboardButton("♻️ Reset Database", callback_data="owner_reset_db")],
+       #         [InlineKeyboardButton("📨 Rate Limit", callback_data="set_rate_limit")],
+          #       InlineKeyboardButton("♻️ Reset Database", callback_data="owner_reset_db")],
 
                 [InlineKeyboardButton("🔙 Admin Panel", callback_data="admin_panel"),
                  InlineKeyboardButton("❌ Close", callback_data="close_message")]
@@ -2908,6 +3239,178 @@ class AnimeBot:
                 )
             else:
                 await callback_query.answer("Admin not found!", show_alert=True)
+
+    # In AnimeBot class
+    async def admin_delete_episode_menu(self, client: Client, callback_query: CallbackQuery, anime_id: int):
+        """Show menu for deleting episodes"""
+        try:
+            if callback_query.from_user.id not in Config.ADMINS:
+                await callback_query.answer("❌ Admin only", show_alert=True)
+                return
+            
+            anime = await self.db.find_anime(anime_id)
+            if not anime:
+                await callback_query.answer("Anime not found", show_alert=True)
+                return
+            
+            # Get all episodes for this anime
+            all_episodes = set()
+            for client in self.db.anime_clients:
+                try:
+                    db = client[self.db.db_name]
+                    episodes = await db.files.distinct("episode", {"anime_id": anime_id})
+                    all_episodes.update(episodes)
+                except Exception:
+                    continue
+            
+            if not all_episodes:
+                await callback_query.answer("No episodes found", show_alert=True)
+                return
+            
+            sorted_eps = sorted(all_episodes)
+            keyboard = []
+            row = []
+            
+            # Create buttons for each episode
+            for ep in sorted_eps:
+                row.append(InlineKeyboardButton(f"Ep {ep}", callback_data=f"del_ep_{anime_id}_{ep}"))
+                if len(row) == 5:
+                    keyboard.append(row)
+                    row = []
+            if row:
+                keyboard.append(row)
+            
+            # Add bulk delete options
+            keyboard.append([
+                InlineKeyboardButton("🗑 Delete ALL Episodes", callback_data=f"del_all_{anime_id}"),
+                InlineKeyboardButton("🔍 Select Range", callback_data=f"del_range_{anime_id}")
+            ])
+            
+            keyboard.append([
+                InlineKeyboardButton("🔙 Back", callback_data=f"anime_{anime_id}"),
+                InlineKeyboardButton("❌ Close", callback_data="close_message")
+            ])
+            
+            await callback_query.message.edit_text(
+                f"🗑 <b>Delete Episodes for:</b>\n{anime['title']}\n\n"
+                "Select episode to delete:",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode=enums.ParseMode.HTML
+            )
+        except Exception as e:
+            logger.error(f"Error in delete episode menu: {e}")
+            await callback_query.answer("Error loading menu", show_alert=True)
+
+    async def confirm_delete_episode(self, client: Client, callback_query: CallbackQuery, anime_id: int, episode: int):
+        """Show confirmation before deleting episode"""
+        try:
+            anime = await self.db.find_anime(anime_id)
+            if not anime:
+                await callback_query.answer("Anime not found", show_alert=True)
+                return
+            
+            # Get files for this episode to show count
+            files = await self.db.find_files(anime_id, episode)
+            file_count = len(files) if files else 0
+            
+            await callback_query.message.edit_text(
+                f"⚠️ <b>Confirm Deletion</b>\n\n"
+                f"Anime: <b>{anime['title']}</b>\n"
+                f"Episode: <b>{episode}</b>\n"
+                f"Files to delete: <b>{file_count}</b>\n\n"
+                "This action cannot be undone!",
+                reply_markup=InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton("✅ Confirm Delete", callback_data=f"confirm_del_{anime_id}_{episode}"),
+                        InlineKeyboardButton("❌ Cancel", callback_data=f"del_menu_{anime_id}")
+                    ]
+                ]),
+                parse_mode=enums.ParseMode.HTML
+            )
+        except Exception as e:
+            logger.error(f"Error in confirm delete: {e}")
+            await callback_query.answer("Error confirming deletion", show_alert=True)
+
+    async def delete_episode(self, client: Client, callback_query: CallbackQuery, anime_id: int, episode: int):
+        """Actually delete the episode"""
+        try:
+            deleted = await self.db.delete_episode(anime_id, episode)
+            
+            await callback_query.message.edit_text(
+                f"✅ Successfully deleted {deleted} files for episode {episode}",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Back to Anime", callback_data=f"anime_{anime_id}")]
+                ])
+            )
+            
+            # Log the deletion
+            logger.info(f"Admin {callback_query.from_user.id} deleted episode {episode} from anime {anime_id}")
+        except Exception as e:
+            logger.error(f"Error deleting episode: {e}")
+            await callback_query.answer("Error deleting episode", show_alert=True)
+
+    async def delete_all_episodes(self, client: Client, callback_query: CallbackQuery, anime_id: int):
+        """Delete all episodes for an anime"""
+        try:
+            anime = await self.db.find_anime(anime_id)
+            if not anime:
+                await callback_query.answer("Anime not found", show_alert=True)
+                return
+            
+            # Get total file count
+            total_files = 0
+            for client in self.db.anime_clients:
+                try:
+                    db = client[self.db.db_name]
+                    count = await db.files.count_documents({"anime_id": anime_id})
+                    total_files += count
+                except Exception:
+                    continue
+            
+            await callback_query.message.edit_text(
+                f"⚠️ <b>Confirm Delete ALL Episodes</b>\n\n"
+                f"Anime: <b>{anime['title']}</b>\n"
+                f"Total files to delete: <b>{total_files}</b>\n\n"
+                "This will remove ALL episodes and cannot be undone!",
+                reply_markup=InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton("✅ Confirm Delete ALL", callback_data=f"confirm_del_all_{anime_id}"),
+                        InlineKeyboardButton("❌ Cancel", callback_data=f"del_menu_{anime_id}")
+                    ]
+                ]),
+                parse_mode=enums.ParseMode.HTML
+            )
+        except Exception as e:
+            logger.error(f"Error in delete all confirmation: {e}")
+            await callback_query.answer("Error preparing deletion", show_alert=True)
+
+    async def confirm_delete_all_episodes(self, client: Client, callback_query: CallbackQuery, anime_id: int):
+        """Actually delete all episodes"""
+        try:
+            deleted = await self.db.delete_episode(anime_id)
+            
+            await callback_query.message.edit_text(
+                f"✅ Successfully deleted {deleted} files for all episodes",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Back to Anime", callback_data=f"anime_{anime_id}")]
+                ])
+            )
+            
+            # Also update anime episode count to 0
+            for client in self.db.anime_clients:
+                try:
+                    db = client[self.db.db_name]
+                    await db.anime.update_one(
+                        {"id": anime_id},
+                        {"$set": {"episodes": 0}}
+                    )
+                except Exception:
+                    continue
+            
+            logger.info(f"Admin {callback_query.from_user.id} deleted ALL episodes from anime {anime_id}")
+        except Exception as e:
+            logger.error(f"Error deleting all episodes: {e}")
+            await callback_query.answer("Error deleting episodes", show_alert=True)
     async def add_owner_start(self, client: Client, callback_query: CallbackQuery):
         """Start process to add an owner"""
         if callback_query.from_user.id not in self.config.OWNERS:
@@ -3773,9 +4276,9 @@ class AnimeBot:
         try:
             # First find the anime to get its title
             anime = None
-            for db_client in self.db.anime_clients:
+            for db_client in self.db.anime_clients:  # Use database client
                 try:
-                    db = client[self.db.db_name]
+                    db = db_client[self.db.db_name]  # Correct - using database client
                     found = await db.anime.find_one({"id": anime_id})
                     if found:
                         anime = found
@@ -3789,9 +4292,9 @@ class AnimeBot:
             
             # Delete across all clusters
             file_count = 0
-            for db_client in self.db.anime_clients:
+            for db_client in self.db.anime_clients:  # Use database client
                 try:
-                    db = client[self.db.db_name]
+                    db = db_client[self.db.db_name]  # Correct - using database client
                     # Count files first
                     file_count += await db.files.count_documents({"anime_id": anime_id})
                     # Delete files
@@ -3815,14 +4318,14 @@ class AnimeBot:
             await self.update_stats("total_files", -file_count)
             
             await self.update_message(
-                client,
+                client,  # Telegram client for messaging
                 callback_query.message,
                 f"🗑️ *Successfully deleted {anime['title']} and {file_count} associated files.*"
             )
         except Exception as e:
             logger.error(f"Error deleting anime {anime_id}: {e}")
             await self.update_message(
-                client,
+                client,  # Telegram client for messaging
                 callback_query.message,
                 "❌ *Error deleting anime!*"
             )
@@ -4134,6 +4637,20 @@ class AnimeBot:
                 f"🆔 *File ID:* `{file_data['_id']}`",
                 parse_mode=enums.ParseMode.MARKDOWN
             )
+                    
+            # Notify users in watchlist
+            watchlist_users = await self.db.watchlist_collection.distinct(
+                "user_id", 
+                {"anime_id": file_data["anime_id"]}
+            )
+            
+            # Add notifications for all users
+            for user_id in watchlist_users:
+                await self.notification_manager.add_notification(
+                    file_data["anime_id"], 
+                    file_data["episode"], 
+                    user_id
+                )
 
         except Exception as e:
             logger.error(f"File processing error: {e}")
@@ -4398,319 +4915,309 @@ class AnimeBot:
         if callback_query.from_user.id not in Config.ADMINS:
             await callback_query.answer("❌ Admin only", show_alert=True)
             return
-
+        
         try:
-            per_page = 10
+            ITEMS_PER_PAGE = 8
             all_anime = []
-
-            # Collect ALL anime from ALL clusters first
+            
+            # Search across all clusters
             for db_client in self.db.anime_clients:
                 try:
                     db = db_client[self.db.db_name]
-                    cursor = db.anime.find(
+                    cluster_anime = await db.anime.find(
                         {},
-                        {"id": 1, "title": 1, "episodes": 1, "is_sequel": 1, "prequel_id": 1, "sequel_id": 1}
-                    ).sort("title", 1)
-                    async for anime in cursor:
-                        all_anime.append(anime)
+                        {"id": 1, "title": 1, "episodes": 1, "is_sequel": 1}
+                    ).sort("title", 1).to_list(None)
+                    all_anime.extend(cluster_anime)
                 except Exception as e:
-                    logger.warning(f"Cluster error: {e}")
+                    logger.error(f"Error fetching anime from cluster: {e}")
                     continue
-
-            if not all_anime:
-                await callback_query.answer("❌ No anime found in database", show_alert=True)
-                return
-
-            # Remove duplicates by ID
+            
+            # Remove duplicates
             seen_ids = set()
             unique_anime = []
             for anime in all_anime:
-                if anime['id'] not in seen_ids:
-                    seen_ids.add(anime['id'])
-                    unique_anime.append(anime)
-
-            total_pages = (len(unique_anime) + per_page - 1) // per_page
-            page = max(1, min(page, total_pages))  # Clamp page to valid range
-
-            start_idx = (page - 1) * per_page
-            end_idx = start_idx + per_page
-            page_anime = unique_anime[start_idx:end_idx]
-
-            keyboard = []
-            for anime in page_anime:
-                title = anime.get('title', 'Untitled')
-                eps = anime.get('episodes', '?')
-                btn_text = f"{title} ({eps} eps)"
-
-                if anime.get('sequel_id'):
-                    btn_text += " 🔜"
-                if anime.get('prequel_id'):
-                    btn_text += " ⏮️"
-                if anime.get('is_sequel'):
-                    btn_text += " (Sequel)"
-
-                keyboard.append([
-                    InlineKeyboardButton(btn_text, callback_data=f"select_sequel_{anime['id']}")
-                ])
-
-            # Pagination controls (without the "Page x/y" button)
-            pagination = []
-            if page > 1:
-                pagination.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"link_sequel_page_{page-1}"))
-
-            if page < total_pages:
-                pagination.append(InlineKeyboardButton("Next ➡️", callback_data=f"link_sequel_page_{page+1}"))
-
-            if pagination:
-                keyboard.append(pagination)
-
-            # Back button
-            keyboard.append([self.get_back_button("admin")])
-
-            await self.update_message(
-                client,
-                callback_query.message,
-                f"🔗 <b>Select Anime to Link as Sequel</b>\n"
-                f"📋 Total Anime: <b>{len(unique_anime)}</b>",
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-
-        except Exception as e:
-            logger.error(f"Link sequel error: {e}")
-            await callback_query.answer("❌ Error loading anime list", show_alert=True)
-
-    async def select_sequel_anime(self, client: Client, callback_query: CallbackQuery):
-        if callback_query.from_user.id not in Config.ADMINS:
-            await callback_query.answer("You don't have permission to access this.", show_alert=True)
-            return
-        
-        sequel_id = int(callback_query.data.split('_')[-1])
-        
-        try:
-            # Search across all clusters for the anime
-            anime = None
-            for db_client in self.db.anime_clients:
-                try:
-                    db = client[self.db.db_name]
-                    found = await db.anime.find_one({"id": sequel_id}, {"title": 1, "is_sequel": 1})
-                    if found:
-                        anime = found
-                        break
-                except Exception as e:
-                    logger.warning(f"Error finding anime in cluster: {e}")
-            
-            if not anime:
-                await self.update_message(
-                    client,
-                    callback_query.message,
-                    "❌ *Anime not found!*"
-                )
-                return
-            
-            if anime.get('is_sequel'):
-                await self.update_message(
-                    client,
-                    callback_query.message,
-                    "⚠️ *This anime is already marked as a sequel!*\n"
-                    "Please select another anime."
-                )
-                return
-            
-            self.user_sessions[callback_query.from_user.id]['linking_sequel'] = {
-                'sequel_id': sequel_id,
-                'sequel_title': anime['title']
-            }
-            
-            # Search across all clusters for potential prequels
-            anime_list = []
-            for db_client in self.db.anime_clients:
-                try:
-                    db = client[self.db.db_name]
-                    cluster_results = await db.anime.find(
-                        {"id": {"$ne": sequel_id}},
-                        {"id": 1, "title": 1, "episodes": 1}
-                    ).sort("title", 1).limit(50).to_list(None)
-                    anime_list.extend(cluster_results)
-                except Exception as e:
-                    logger.warning(f"Error fetching anime from cluster: {e}")
-            
-            # Deduplicate
-            seen_ids = set()
-            unique_anime = []
-            for anime in anime_list:
                 if anime["id"] not in seen_ids:
                     seen_ids.add(anime["id"])
                     unique_anime.append(anime)
             
             if not unique_anime:
-                await self.update_message(
-                    client,
-                    callback_query.message,
-                    "ℹ️ *No other anime found in database!*"
-                )
+                await callback_query.answer("❌ No anime found in database", show_alert=True)
                 return
             
+            # Pagination
+            total_pages = (len(unique_anime) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE
+            page = max(1, min(page, total_pages))
+            start_idx = (page - 1) * ITEMS_PER_PAGE
+            end_idx = start_idx + ITEMS_PER_PAGE
+            page_anime = unique_anime[start_idx:end_idx]
+
+            keyboard = []
+            for anime in page_anime:
+                btn_text = f"{anime['title']} ({anime.get('episodes', '?')} eps)"
+                if anime.get('is_sequel'):
+                    btn_text += " (Sequel)"
+                keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"select_sequel_{anime['id']}")])
+            
+            # Pagination buttons
+            nav_buttons = []
+            if page > 1:
+                nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"link_sequel_{page-1}"))
+            if page < total_pages:
+                nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"link_sequel_{page+1}"))
+            
+            if nav_buttons:
+                keyboard.append(nav_buttons)
+            
+            keyboard.append([
+                InlineKeyboardButton("🔙 Admin Panel", callback_data="admin_panel"),
+                InlineKeyboardButton("❌ Close", callback_data="close_message")
+            ])
+            
+            await callback_query.message.edit_text(
+                f"🔗 <b>Select Anime to Link as Sequel (Page {page}/{total_pages})</b>",
+                reply_markup=InlineKeyboardMarkup(keyboard))
+                
+        except Exception as e:
+            logger.error(f"Error in link_sequel_start: {e}")
+            await callback_query.answer("❌ Error loading anime list", show_alert=True)
+
+    async def select_sequel_anime(self, client: Client, callback_query: CallbackQuery, sequel_id: int, page: int = 1):
+        try:
+            # Find the sequel anime
+            sequel = None
+            for db_client in self.db.anime_clients:
+                try:
+                    db = db_client[self.db.db_name]
+                    found = await db.anime.find_one({"id": sequel_id})
+                    if found:
+                        sequel = found
+                        break
+                except Exception as e:
+                    logger.error(f"Error finding anime in cluster: {e}")
+                    continue
+
+            if not sequel:
+                await callback_query.answer("❌ Anime not found", show_alert=True)
+                return
+
+            if sequel.get('is_sequel'):
+                await callback_query.answer("⚠️ This anime is already a sequel!", show_alert=True)
+                return
+
+            # Store session
+            self.user_sessions[callback_query.from_user.id] = {
+                'linking_sequel': {
+                    'sequel_id': sequel_id,
+                    'sequel_title': sequel['title']
+                }
+            }
+
+            limit = 10
+            skip = (page - 1) * limit
+            all_anime = []
+            total_count = 0
+
+            for db_client in self.db.anime_clients:
+                try:
+                    db = db_client[self.db.db_name]
+                    total_count += await db.anime.count_documents({"id": {"$ne": sequel_id}})
+                    cluster_anime = await db.anime.find(
+                        {"id": {"$ne": sequel_id}},
+                        {"id": 1, "title": 1, "episodes": 1}
+                    ).sort("title", 1).skip(skip).limit(limit).to_list(None)
+                    all_anime.extend(cluster_anime)
+                except Exception as e:
+                    logger.error(f"Error fetching anime from cluster: {e}")
+                    continue
+
+            # Remove duplicates
+            seen_ids = set()
+            unique_anime = []
+            for anime in all_anime:
+                if anime["id"] not in seen_ids:
+                    seen_ids.add(anime["id"])
+                    unique_anime.append(anime)
+
+            if not unique_anime:
+                await callback_query.answer("❌ No anime found", show_alert=True)
+                return
+
+            # Build keyboard
             keyboard = []
             for anime in unique_anime:
                 btn_text = f"{anime['title']} ({anime.get('episodes', '?')} eps)"
                 keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"select_prequel_{anime['id']}")])
-            
-            keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="admin_link_sequel")])
-            await self.update_message(
-                client,
-                callback_query.message,
-                f"🔗 *Link {anime['title']} as sequel to:*",
+
+            # Pagination buttons
+            pagination_buttons = []
+            if page > 1:
+                pagination_buttons.append(InlineKeyboardButton("⏮ Prev", callback_data=f"sequel_page_{sequel_id}_{page-1}"))
+            if skip + limit < total_count:
+                pagination_buttons.append(InlineKeyboardButton("Next ⏭", callback_data=f"sequel_page_{sequel_id}_{page+1}"))
+            if pagination_buttons:
+                keyboard.append(pagination_buttons)
+
+            # Back / Cancel
+            keyboard.append([
+                InlineKeyboardButton("🔙 Back", callback_data="link_sequel_1"),
+                InlineKeyboardButton("❌ Cancel", callback_data="admin_panel")
+            ])
+
+            await callback_query.message.edit_text(
+                f"🔗 <b>Select Prequel for:</b> {sequel['title']}\n📄 Page {page}",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
-        except Exception as e:
-            logger.error(f"Error selecting sequel anime: {e}")
-            await callback_query.answer("Error selecting sequel anime.", show_alert=True)
 
-    async def select_prequel_anime(self, client: Client, callback_query: CallbackQuery):
-        if callback_query.from_user.id not in Config.ADMINS:
-            await callback_query.answer("You don't have permission to access this.", show_alert=True)
-            return
-        
-        prequel_id = int(callback_query.data.split('_')[-1])
-        user_id = callback_query.from_user.id
-        
-        if user_id not in self.user_sessions or 'linking_sequel' not in self.user_sessions[user_id]:
-            await callback_query.answer("Session expired. Please start again.", show_alert=True)
-            return
-        
-        sequel_id = self.user_sessions[user_id]['linking_sequel']['sequel_id']
-        sequel_title = self.user_sessions[user_id]['linking_sequel']['sequel_title']
-        
+        except Exception as e:
+            logger.error(f"Error in select_sequel_anime: {e}")
+            await callback_query.answer("❌ Error selecting sequel", show_alert=True)
+
+
+    async def select_prequel_anime(self, client: Client, callback_query: CallbackQuery, prequel_id: int):
         try:
+            user_id = callback_query.from_user.id
+            if user_id not in self.user_sessions or 'linking_sequel' not in self.user_sessions[user_id]:
+                await callback_query.answer("❌ Session expired", show_alert=True)
+                return
+            
+            sequel_id = self.user_sessions[user_id]['linking_sequel']['sequel_id']
+            sequel_title = self.user_sessions[user_id]['linking_sequel']['sequel_title']
+            
             # Find prequel across all clusters
             prequel = None
             for db_client in self.db.anime_clients:
                 try:
-                    db = client[self.db.db_name]
-                    found = await db.anime.find_one({"id": prequel_id}, {"title": 1})
+                    db = db_client[self.db.db_name]
+                    found = await db.anime.find_one({"id": prequel_id})
                     if found:
                         prequel = found
                         break
                 except Exception as e:
-                    logger.warning(f"Error finding prequel in cluster: {e}")
+                    logger.error(f"Error finding anime in cluster: {e}")
+                    continue
             
             if not prequel:
-                await self.update_message(
-                    client,
-                    callback_query.message,
-                    "❌ *Prequel anime not found!*"
-                )
+                await callback_query.answer("❌ Prequel not found", show_alert=True)
                 return
             
-            # Update both anime across all clusters
-            success = False
+            # Update both anime in all clusters
+            updated = False
             for db_client in self.db.anime_clients:
                 try:
-                    db = client[self.db.db_name]
+                    db = db_client[self.db.db_name]
                     # Update sequel
                     await db.anime.update_one(
                         {"id": sequel_id},
-                        {"$set": {"is_sequel": True, "prequel_id": prequel_id}}
+                        {"$set": {
+                            "prequel_id": prequel_id,
+                            "is_sequel": True
+                        }}
                     )
                     # Update prequel
                     await db.anime.update_one(
                         {"id": prequel_id},
                         {"$set": {"sequel_id": sequel_id}}
                     )
-                    success = True
+                    updated = True
                 except Exception as e:
-                    logger.warning(f"Error updating in cluster: {e}")
+                    logger.error(f"Error updating cluster: {e}")
+                    continue
             
-            if not success:
+            if not updated:
                 raise Exception("Failed to update any cluster")
             
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]
-            ])
-            
-            await self.update_message(
-                client,
-                callback_query.message,
-                f"✅ *Successfully linked sequels:*\n\n"
-                f"⏮️ *Prequel:* {prequel['title']}\n"
-                f"🔜 *Sequel:* {sequel_title}\n\n"
-                f"🆔 *Prequel ID:* `{prequel_id}`\n"
-                f"🆔 *Sequel ID:* `{sequel_id}`",
-                reply_markup=keyboard
-            )
-            
-            if user_id in self.user_sessions:
+            # Clear session
+            if user_id in self.user_sessions and 'linking_sequel' in self.user_sessions[user_id]:
                 del self.user_sessions[user_id]['linking_sequel']
+            
+            await callback_query.message.edit_text(
+                f"✅ <b>Successfully linked sequels:</b>\n\n"
+                f"⏮️ <b>Prequel:</b> {prequel['title']}\n"
+                f"🔜 <b>Sequel:</b> {sequel_title}\n\n"
+                f"🆔 <b>Prequel ID:</b> <code>{prequel_id}</code>\n"
+                f"🆔 <b>Sequel ID:</b> <code>{sequel_id}</code>",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Admin Panel", callback_data="admin_panel")]
+                ]))
+                
         except Exception as e:
-            logger.error(f"Error linking sequels: {e}")
-            await self.update_message(
-                client,
-                callback_query.message,
-                "❌ *Error linking sequels!*"
-            )
-
-    async def view_anime_ids(self, client: Client, callback_query: CallbackQuery):
+            logger.error(f"Error in select_prequel_anime: {e}")
+            await callback_query.answer("❌ Error linking sequels", show_alert=True)
+    async def view_anime_ids(self, client: Client, callback_query: CallbackQuery, page: int = 1):
         if callback_query.from_user.id not in Config.ADMINS:
-            await callback_query.answer("You don't have permission to access this.", show_alert=True)
+            await callback_query.answer("❌ Admin only", show_alert=True)
             return
         
         try:
-            # Search across all clusters for anime list
-            anime_list = []
+            ITEMS_PER_PAGE = 10
+            all_anime = []
+            
+            # Search across all clusters
             for db_client in self.db.anime_clients:
                 try:
-                    db = client[self.db.db_name]
-                    cluster_results = await db.anime.find(
+                    db = db_client[self.db.db_name]
+                    cluster_anime = await db.anime.find(
                         {},
                         {"id": 1, "title": 1, "episodes": 1, "is_sequel": 1, "prequel_id": 1, "sequel_id": 1}
-                    ).sort("title", 1).limit(50).to_list(None)
-                    anime_list.extend(cluster_results)
+                    ).sort("title", 1).to_list(None)
+                    all_anime.extend(cluster_anime)
                 except Exception as e:
-                    logger.warning(f"Error fetching anime from cluster: {e}")
+                    logger.error(f"Error fetching anime from cluster: {e}")
+                    continue
             
-            # Deduplicate
+            # Remove duplicates
             seen_ids = set()
             unique_anime = []
-            for anime in anime_list:
+            for anime in all_anime:
                 if anime["id"] not in seen_ids:
                     seen_ids.add(anime["id"])
                     unique_anime.append(anime)
             
             if not unique_anime:
-                await self.update_message(
-                    client,
-                    callback_query.message,
-                    "ℹ️ *No anime found in database!*"
-                )
+                await callback_query.answer("❌ No anime found in database", show_alert=True)
                 return
             
-            message = "🆔 *Anime IDs*\n\n"
-            for anime in unique_anime:
-                message += f"• *{anime['title']}* ({anime.get('episodes', '?')} eps)\n"
-                message += f"  🆔 `{anime['id']}`\n"
+            # Pagination
+            total_pages = (len(unique_anime) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE
+            page = max(1, min(page, total_pages))
+            start_idx = (page - 1) * ITEMS_PER_PAGE
+            end_idx = start_idx + ITEMS_PER_PAGE
+            page_anime = unique_anime[start_idx:end_idx]
+
+            message = "🆔 <b>Anime IDs</b>\n\n"
+            for anime in page_anime:
+                message += f"• <b>{anime['title']}</b> ({anime.get('episodes', '?')} eps)\n"
+                message += f"  🆔 <code>{anime['id']}</code>\n"
                 if anime.get('is_sequel'):
-                    message += f"  ⏮️ Prequel ID: `{anime.get('prequel_id', 'None')}`\n"
+                    message += f"  ⏮️ Prequel ID: <code>{anime.get('prequel_id', 'None')}</code>\n"
                 if anime.get('sequel_id'):
-                    message += f"  🔜 Sequel ID: `{anime.get('sequel_id', 'None')}`\n"
+                    message += f"  🔜 Sequel ID: <code>{anime.get('sequel_id', 'None')}</code>\n"
                 message += "\n"
             
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]
+            # Pagination buttons
+            keyboard = []
+            if page > 1:
+                keyboard.append([InlineKeyboardButton("⬅️ Previous", callback_data=f"view_ids_{page-1}")])
+            if page < total_pages:
+                if not keyboard:
+                    keyboard.append([])
+                keyboard[0].append(InlineKeyboardButton("Next ➡️", callback_data=f"view_ids_{page+1}"))
+            
+            keyboard.append([
+                InlineKeyboardButton("🔙 Admin Panel", callback_data="admin_panel"),
+                InlineKeyboardButton("❌ Close", callback_data="close_message")
             ])
             
             await self.update_message(
                 client,
                 callback_query.message,
                 message,
-                reply_markup=keyboard
-            )
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )    
         except Exception as e:
-            logger.error(f"Error fetching anime list: {e}")
-            await self.update_message(
-                client,
-                callback_query.message,
-                "❌ *Error fetching anime list!*"
-            )
+            logger.error(f"Error in view_anime_ids: {e}")
+            await callback_query.answer("❌ Error loading anime IDs", show_alert=True)
 
     async def show_anime_id(self, client: Client, callback_query: CallbackQuery, anime_id: int):
         try:
@@ -4786,33 +5293,52 @@ class AnimeBot:
                 "❌ *Error resetting database!*"
             )
 
-
-
-    async def process_search(self, client: Client, message: Message):
+    async def process_search(self, client: Client, message: Union[Message, CallbackQuery], page: int = 1):
+        # Add force sub check
+        user_id = message.from_user.id if isinstance(message, Message) else message.from_user.id
+    
+        # Force sub check
+        if not await check_force_sub(client, user_id, message if isinstance(message, Message) else message.message):
+            return
         try:
             user_id = message.from_user.id
-            search_query = message.text.strip()
+            
+            # Get search query - different handling for Message vs CallbackQuery
+            if isinstance(message, Message):
+                search_query = message.text.strip()
+                if not search_query:
+                    await message.reply_text("🔍 Please enter a valid anime name.")
+                    return
+            else:  # CallbackQuery
+                # Extract search query from callback data (format: "search_[prev/next]_query_page")
+                parts = message.data.split('_')
+                direction = parts[1]
+                search_query = '_'.join(parts[2:-1])  # Handle queries with underscores
+                current_page = int(parts[-1])
+                
+                # Adjust page based on direction
+                if direction == 'prev':
+                    page = max(1, current_page - 1)
+                else:
+                    page = current_page + 1
 
-            if not search_query:
-                await message.reply_text("🔍 Please enter a valid anime name.")
-                return
-
-            results = await self.db.search_anime(search_query, Config.MAX_SEARCH_RESULTS)
-
+            # Search across all clusters
+            results = await self.db.search_anime(search_query, limit=100)  # Get more results for pagination
+            
             if not results:
-                # Fallback to regex search
+                # Fallback to regex search if no results from text search
                 similar_anime = []
                 for db_client in self.db.anime_clients:
                     try:
-                        db = client[self.db.db_name]
+                        db = db_client[self.db.db_name]
                         cluster_results = await db.anime.find(
                             {"title": {"$regex": f".*{re.escape(search_query)}.*", "$options": "i"}},
                             {"id": 1, "title": 1, "episodes": 1}
-                        ).limit(5).to_list(None)
+                        ).limit(50).to_list(None)
                         similar_anime.extend(cluster_results)
                     except Exception as e:
                         logger.warning(f"Error searching anime in cluster: {e}")
-
+                
                 # Deduplicate
                 seen_ids = set()
                 unique_anime = []
@@ -4820,72 +5346,86 @@ class AnimeBot:
                     if anime["id"] not in seen_ids:
                         seen_ids.add(anime["id"])
                         unique_anime.append(anime)
+                results = unique_anime
 
-                if unique_anime:
-                    keyboard = [
-                        [InlineKeyboardButton(
-                            f"{a['title']} ({a.get('episodes', '?')} eps)", 
-                            callback_data=f"anime_{a['id']}"
-                        ) for a in unique_anime[:5]]
-                    ]
-                    keyboard.append([
-                        InlineKeyboardButton("• ʙᴀᴄᴋ •", callback_data="start_menu"),
-                        InlineKeyboardButton("• ᴄʟᴏꜱᴇ •", callback_data="close_message")
-                    ])
-                    await message.reply_photo(
-                        photo=Config.START_PIC,
-                        caption="📋 *Similar Anime:*",
-                        reply_markup=InlineKeyboardMarkup(keyboard),
-                        parse_mode=enums.ParseMode.MARKDOWN
-                    )
+            if not results:
+                reply_method = message.reply_text if isinstance(message, Message) else message.message.edit_text
+                await reply_method("🔍 No results found. Try a different search term.")
                 return
 
+            # Pagination
+            ITEMS_PER_PAGE = 10
+            total_pages = (len(results) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE
+            page = max(1, min(page, total_pages))
+            start_idx = (page - 1) * ITEMS_PER_PAGE
+            end_idx = start_idx + ITEMS_PER_PAGE
+            page_results = results[start_idx:end_idx]
+
+            # Create keyboard
             keyboard = []
-            for anime in results:
-                rating = self.format_rating(anime.get('score'))
-                btn_text = f"{anime['title']} ({anime.get('episodes', '?')} eps) {rating}"
+            for anime in page_results:
+                btn_text = f"{anime['title']} ({anime.get('episodes', '?')} eps)"
                 keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"anime_{anime['id']}")])
+
+            # Add pagination buttons if needed
+            pagination_buttons = []
+            if page > 1:
+                pagination_buttons.append(
+                    InlineKeyboardButton("⬅️", callback_data=f"search_prev_{search_query}_{page-1}")
+                )
+            if end_idx < len(results):
+                pagination_buttons.append(
+                    InlineKeyboardButton("➡️", callback_data=f"search_next_{search_query}_{page+1}")
+                )
+            
+            if pagination_buttons:
+                keyboard.append(pagination_buttons)
 
             keyboard.append([
                 InlineKeyboardButton("• ʙᴀᴄᴋ •", callback_data="start_menu"),
                 InlineKeyboardButton("• ᴄʟᴏꜱᴇ •", callback_data="close_message")
             ])
 
-            await message.reply_photo(
-                photo=Config.START_PIC,
-                caption=f"🔍 *Search results for:* `{search_query}`",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode=enums.ParseMode.MARKDOWN
+            # Create caption
+            caption = (
+                f"🔍 <b>Search results for:</b> <code>{html.escape(search_query)}</code>\n"
+                f"📄 <b>Page:</b> {page}/{total_pages}\n"
+                f"📋 <b>Total results:</b> {len(results)}"
             )
 
+            # Handle message differently based on input type
+            if isinstance(message, CallbackQuery):
+                # Edit existing message for pagination
+                await self.update_message(
+                    client,
+                    message.message,
+                    caption,
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                    photo=Config.START_PIC
+                )
+            else:
+                # Send new message for initial search
+                await message.reply_photo(
+                    photo=Config.START_PIC,
+                    caption=caption,
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                    parse_mode=enums.ParseMode.HTML
+                )
+
+            # Update user stats
             await self.db.users_collection.update_one(
                 {"user_id": user_id},
                 {"$inc": {"searches": 1}, "$set": {"last_active": datetime.now()}}
             )
             await self.update_stats("total_searches")
 
-            if user_id in self.user_sessions and 'awaiting_search' in self.user_sessions[user_id]:
-                del self.user_sessions[user_id]['awaiting_search']
-
         except Exception as e:
             logger.error(f"Error in process_search: {e}")
-            await message.reply_text("⚠️ Error processing search. Please try again.")
-
-
-    def format_rating(self, score: Optional[float]) -> str:
-        """Convert score (0-100) to 5-star rating with half stars"""
-        if score is None:
-            return ""
-        
-        stars = (score / 100) * 5
-        stars = min(5, max(0, stars))  # Clamp between 0-5
-        
-        full_stars = int(stars)
-        half_star = 1 if stars - full_stars >= 0.5 else 0
-        empty_stars = 5 - full_stars - half_star
-        
-        rating = "⭐" * full_stars + "✨" * half_star + "☆" * empty_stars
-        return f"{rating} ({stars:.1f}/5)"
+            error_msg = "⚠️ Error processing search. Please try again."
+            if isinstance(message, CallbackQuery):
+                await message.answer(error_msg, show_alert=True)
+            else:
+                await message.reply_text(error_msg)
     async def check_expiry_and_revoke(self):
         """Check and revoke expired premium access"""
         expired_users = []
@@ -4967,18 +5507,6 @@ class AnimeBot:
             return "N/A"
         return f"{date.get('day', '?')}/{date.get('month', '?')}/{date['year']}"
 
-    async def create_progress_bar(self, score: int) -> str:
-        """Create a star rating progress bar based on score (0-100)"""
-        if not score or score < 0 or score > 100:
-            return ""
-        
-        # Calculate filled and empty stars
-        filled_stars = round(score / 20)  # 5 stars total, each represents 20 points
-        empty_stars = 5 - filled_stars
-        
-        # Use different star characters for better visual appearance
-        return "⭐" * filled_stars + "☆" * empty_stars
-
     async def delete_message_after_delay(self, client: Client, chat_id: int, message_id: int, delay: int):
         await asyncio.sleep(delay)
         try:
@@ -4986,92 +5514,6 @@ class AnimeBot:
         except Exception as e:
             logger.error(f"Error deleting message: {e}")
 
-    async def recent_command(self, client: Client, message: Message):
-        try:
-            items_per_page = 10  # Customize how many anime per page
-
-            # Default page
-            page = 0
-
-            # Handle page if sent via callback
-            if hasattr(message, 'data') and message.data.startswith("recent_page_"):
-                try:
-                    page = int(message.data.split("_")[-1])
-                except ValueError:
-                    page = 0
-
-            # Fetch all recent anime from clusters
-            recent_anime = []
-            for db_client in self.db.anime_clients:
-                try:
-                    db = client[self.db.db_name]
-                    cluster_results = await db.anime.find(
-                        {},
-                        {"id": 1, "title": 1, "episodes": 1, "last_updated": 1}
-                    ).sort("last_updated", -1).limit(100).to_list(None)
-                    recent_anime.extend(cluster_results)
-                except Exception as e:
-                    logger.warning(f"Error fetching recent anime from cluster: {e}")
-
-            # Deduplicate and sort
-            seen_ids = set()
-            unique_anime = []
-            for anime in recent_anime:
-                if anime["id"] not in seen_ids:
-                    seen_ids.add(anime["id"])
-                    unique_anime.append(anime)
-
-            unique_anime.sort(key=lambda x: x.get("last_updated", datetime.min), reverse=True)
-
-            total_pages = (len(unique_anime) + items_per_page - 1) // items_per_page
-
-            if total_pages == 0:
-                await message.reply_text("No recently updated anime found.")
-                return
-
-            # Paginate the results
-            paginated_anime = unique_anime[page * items_per_page:(page + 1) * items_per_page]
-
-            # Prepare keyboard
-            keyboard = []
-            for anime in paginated_anime:
-                keyboard.append([
-                    InlineKeyboardButton(
-                        f"{anime['title']} ({anime.get('episodes', '?')} eps)",
-                        callback_data=f"anime_{anime['id']}"
-                    )
-                ])
-
-            # Pagination buttons
-            pagination_buttons = []
-            if page > 0:
-                pagination_buttons.append(
-                    InlineKeyboardButton("⬅️ Previous", callback_data=f"recent_page_{page-1}")
-                )
-            pagination_buttons.append(
-                InlineKeyboardButton(f"Page {page + 1}/{total_pages}", callback_data="noop")
-            )
-            if page < total_pages - 1:
-                pagination_buttons.append(
-                    InlineKeyboardButton("Next ➡️", callback_data=f"recent_page_{page+1}")
-                )
-
-            if pagination_buttons:
-                keyboard.append(pagination_buttons)
-
-            keyboard.append([
-                
-                InlineKeyboardButton("• ᴄʟᴏꜱᴇ •", callback_data="close_message")
-            ])
-
-            await message.reply_text(
-                "🔄 Recently Updated Anime:",
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-
-        except Exception as e:
-            logger.error(f"Recent command error: {e}")
-            await message.reply_text("Error loading recent anime")
     async def show_available_anime(self, client: Client, message: Message):
         try:
             keyboard = []
@@ -5106,19 +5548,12 @@ class AnimeBot:
 
     async def show_start_menu(self, client: Client, callback_query: CallbackQuery):
         user = callback_query.from_user
-        welcome_text = (
-            f"Hi {user.first_name}! Welcome  🎉\n\n"
-            "🔎 Search for your favorite anime\n"
-            "📚 Explore our extensive anime library\n"
-            "📥 Download episodes in multiple qualities \n"
-            "📋 Add anime to your watchlist\n\n"
-            "Get started with the buttons below!"
-        )
-        
+        welcome_text = Scripts.WELCOME_TEXT.format(first_name=user.first_name)
+
 
         keyboard = InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("📢 ᴜᴘᴅᴀᴛᴇꜱ", url="https://t.me/yourchannel")
+                InlineKeyboardButton("📢 ᴜᴘᴅᴀᴛᴇꜱ", url="https://t.me/TFIBOTS")
             ],
             [
                 InlineKeyboardButton("📜 ʙʀᴏᴡꜱᴇ ᴀɴɪᴍᴇ", callback_data="available_anime"),
@@ -5155,20 +5590,22 @@ class AnimeBot:
     async def get_episode_count(self, anime_id: int) -> int:
         anime = await self.db.find_anime(anime_id)
         return anime.get('episodes', 1)
-    async def show_anime_by_letter(self, client: Client, callback_query: CallbackQuery, letter: str):
+    async def show_anime_by_letter(self, client: Client, callback_query: CallbackQuery, letter: str, page: int = 1):
         try:
+            ITEMS_PER_PAGE = 8  # Number of items per page
+            
             # Search across all clusters for anime starting with the letter
             anime_list = []
             for db_client in self.db.anime_clients:
                 try:
-                    db = client[self.db.db_name]
+                    db = db_client[self.db.db_name]
                     cluster_results = await db.anime.find(
                         {"title": {"$regex": f"^{letter}", "$options": "i"}},
                         {"id": 1, "title": 1, "episodes": 1, "studio": 1}
-                    ).sort("title", 1).limit(50).to_list(None)
+                    ).sort("title", 1).to_list(None)
                     anime_list.extend(cluster_results)
                 except Exception as e:
-                    logger.warning(f"Error searching anime in cluster: {e}")
+                    logger.warning(f"Error searching anime in cluster {db_client}: {e}")
             
             # Deduplicate
             seen_ids = set()
@@ -5182,27 +5619,42 @@ class AnimeBot:
                 await callback_query.answer(f"No anime found starting with '{letter}'.", show_alert=True)
                 return
 
+            # Calculate pagination
+            total_pages = (len(unique_anime) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE
+            page = max(1, min(page, total_pages))  # Clamp page to valid range
+            start_idx = (page - 1) * ITEMS_PER_PAGE
+            end_idx = start_idx + ITEMS_PER_PAGE
+            page_anime = unique_anime[start_idx:end_idx]
+
             keyboard = []
-            for anime in unique_anime:
+            for anime in page_anime:
                 btn_text = f"{anime['title']} ({anime.get('episodes', '?')} eps)"
                 keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"anime_{anime['id']}")])
+
+            # Add pagination controls if needed
+            pagination_buttons = []
+            if page > 1:
+                pagination_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"letter_{letter}_{page-1}"))
+            if end_idx < len(unique_anime):
+                pagination_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"letter_{letter}_{page+1}"))
             
-            keyboard.append([InlineKeyboardButton("• ʙᴀᴄᴋ •", callback_data="available_anime")])
+            if pagination_buttons:
+                keyboard.append(pagination_buttons)
+
+            keyboard.append([
+                InlineKeyboardButton("• ʙᴀᴄᴋ •", callback_data="available_anime"),
+                InlineKeyboardButton("• ᴄʟᴏꜱᴇ •", callback_data="close_message")
+            ])
             
             await self.update_message(
                 client,
                 callback_query.message,
-                f"🌀 <b><u>Anime starting with '{letter}':</u></b>",
+                f"🌀 <b>Anime starting with '{letter}' (Page {page}/{total_pages}):</b>",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
         except Exception as e:
             logger.error(f"Error fetching anime by letter {letter}: {e}")
-            await callback_query.message.reply_text("⚠️ Error fetching anime list. Please try again.")
-
-
-    # Add this to your AnimeBot class
-    
-
+            await callback_query.answer("⚠️ Error fetching anime list. Please try again.", show_alert=True)
     async def today_schedule_command(self, client: Client, message: Message):
         """Show today's anime schedule with auto-delete"""
         try:
@@ -5345,7 +5797,7 @@ class AnimeBot:
                 else:
                     access_level = 1
                     
-            max_downloads = self.config.MAX_DAILY_DOWNLOADS.get(access_level, 24)
+            max_downloads = self.config.MAX_DAILY_DOWNLOADS.get(access_level, 30)
             
             # Unlimited downloads (-1 means unlimited)
             if max_downloads == -1:
@@ -5392,24 +5844,26 @@ class AnimeBot:
             except Exception as e:
                 logger.error(f"Daily reset error: {e}")
                 await asyncio.sleep(3600)  # Retry after 1 hour if error occurs    
-
-
     async def handle_callback_query(self, client: Client, callback_query: CallbackQuery):
         try:
             data = callback_query.data
             user_id = callback_query.from_user.id
             message = callback_query.message
-            
-            # Check if in group and original user
-            if message.chat.type != ChatType.PRIVATE:
-                if 'original_user' in self.user_sessions.get(message.id, {}):
-                    if user_id != self.user_sessions[message.id]['original_user']:
-                        await callback_query.answer("This isn't your menu!", show_alert=True)
+
+            # ⛔ Reject other users in group menus
+            if message and message.chat and message.chat.type != ChatType.PRIVATE:
+                session = self.user_sessions.get(message.id)
+                if session:
+                    original_user = session.get("original_user")
+                    if original_user and user_id != original_user:
+                        await callback_query.answer("⚠️ This menu is not for you.", show_alert=True)
                         return
-            # Rate limiting check
+
+            # ⏱️ Rate limiting check
             if not await self.check_rate_limit(user_id):
                 await callback_query.answer("Please wait before performing another action.", show_alert=True)
                 return
+
 
             # ========================
             # 🔐 Premium System Handlers
@@ -5582,6 +6036,41 @@ class AnimeBot:
                     await callback_query.message.delete()
                 await self.premium.show_my_plan(client, callback_query.message)
             # ========================
+            #  Forcesub Handlers
+            # ========================
+
+
+                # Add force subscription handlers
+            elif data == "check_force_sub":
+                joined = await self.force_sub.check_member(client, user_id)
+                if joined:
+                    await callback_query.answer("✅ Thanks for joining!", show_alert=True)
+                    await callback_query.message.delete()
+                    # Restart the command they were trying to access
+                    await self.start(client, callback_query.message)
+                else:
+                    await callback_query.answer("❗ You're still missing one or more channels.", show_alert=True)
+                return
+                
+            elif data == "force_sub_settings":
+                await self.force_sub.show_settings(client, callback_query.message)
+                return
+                
+            elif data == "toggle_force_sub":
+                await self.force_sub.toggle_force_sub(not self.force_sub.force_sub_enabled)
+                await self.force_sub.show_settings(client, callback_query.message)
+                return
+                
+            elif data == "add_force_sub_channel":
+                await callback_query.message.delete()
+                await self.force_sub.add_channel_start(client, callback_query.message)
+                return
+                
+            elif data == "remove_force_sub_channel":
+                await callback_query.message.delete()
+                await self.force_sub.remove_channel_start(client, callback_query.message)
+                return
+            # ========================
             # ⚙️ Settings Handlers
             # ========================
             elif data == "admin_settings" or data.startswith(("set_", "setval_")):
@@ -5626,7 +6115,28 @@ class AnimeBot:
                     await self.toggle_restrict_adult(client, callback_query)
                 else:
                     await callback_query.answer("❌ Owner only", show_alert=True)
-
+            # In your callback query handler
+            # In your callback query handler
+            elif data.startswith("del_menu_"):
+                anime_id = int(data.split("_")[2])
+                await self.admin_delete_episode_menu(client, callback_query, anime_id)
+            elif data.startswith("del_ep_"):
+                parts = data.split("_")
+                anime_id = int(parts[2])
+                episode = int(parts[3])
+                await self.confirm_delete_episode(client, callback_query, anime_id, episode)
+            elif data.startswith("confirm_del_all_"):
+                anime_id = int(data.split("_")[3])
+                await self.confirm_delete_all_episodes(client, callback_query, anime_id)
+            elif data.startswith("confirm_del_"):
+                parts = data.split("_")
+                anime_id = int(parts[2])
+                episode = int(parts[3])
+                await self.delete_episode(client, callback_query, anime_id, episode)
+            elif data.startswith("del_all_"):
+                anime_id = int(data.split("_")[2])
+                await self.delete_all_episodes(client, callback_query, anime_id)
+       
             # ========================
             # 👑 Owner Tools Handlers
             # ========================
@@ -5665,9 +6175,10 @@ class AnimeBot:
                 await self.show_anime_by_letter(client, callback_query, letter)
                 
             elif data.startswith("letter_"):
-                letter = data.split("_")[1]
-                await self.show_anime_by_letter(client, callback_query, letter)
-                
+                parts = callback_query.data.split("_")
+                letter = parts[1]
+                page = int(parts[2]) if len(parts) > 2 else 1
+                await self.show_anime_by_letter(client, callback_query, letter, page)
             elif data.startswith("anime_"):
                 anime_id = int(data.split("_")[1])
                 await self.show_anime_details(client, callback_query, anime_id)
@@ -5726,7 +6237,8 @@ class AnimeBot:
                 
             elif data == "search_anime":
                 await self.search_anime(client, callback_query.message)
-
+            elif data.startswith(("search_prev_", "search_next_")):
+                await self.process_search(client, callback_query)
             # ========================
             # 👮 Admin Panel Handlers
             # ========================
@@ -5821,20 +6333,51 @@ class AnimeBot:
             elif data.startswith("link_sequel_page_"):
                 page = int(data.split("_")[-1])
                 await self.link_sequel_start(client, callback_query, page)
-            
             elif data.startswith("select_sequel_"):
-                await self.select_sequel_anime(client, callback_query)
-                
+                sequel_id = int(data.split("_")[2])
+                await self.select_sequel_anime(client, callback_query, sequel_id, page=1)  # default to page 1
+
             elif data.startswith("select_prequel_"):
-                await self.select_prequel_anime(client, callback_query)
+                prequel_id = int(data.split("_")[2])
+                await self.select_prequel_anime(client, callback_query, prequel_id)
+
+            elif data.startswith("sequel_page_"):
+                parts = data.split("_")
+                if len(parts) == 4:
+                    sequel_id = int(parts[2])
+                    page = int(parts[3])
+                    await self.select_sequel_anime(client, callback_query, sequel_id, page)
+
+            elif data.startswith("link_sequel"):
+                page = int(data.split("_")[2]) if len(data.split("_")) > 2 else 1
+                await self.link_sequel_start(client, callback_query, page)
                 
             elif data == "admin_view_ids":
-                await self.view_anime_ids(client, callback_query)
-                
+                await self.view_anime_ids(client, callback_query, page=1)
             elif data.startswith("show_id_"):
                 anime_id = int(data.split("_")[2])
-                await self.show_anime_id(client, callback_query, anime_id)
-                
+                anime = await self.db.find_anime(anime_id)
+                if anime:
+                    msg = (
+                        f"🆔 Anime ID: <code>{anime_id}</code>\n"
+                        f"📺 Title: {anime.get('title', 'Unknown')}\n"
+                        f"🔗 Type: {anime.get('type', 'TV')}\n"
+                    )
+                    if anime.get('prequel_id'):
+                        msg += f"⏮️ Prequel ID: <code>{anime['prequel_id']}</code>\n"
+                    if anime.get('sequel_id'):
+                        msg += f"⏭️ Sequel ID: <code>{anime['sequel_id']}</code>"
+                    await callback_query.answer(msg, show_alert=True)
+                else:
+                    await callback_query.answer("Anime not found", show_alert=True)
+            elif data.startswith("view_ids_"):
+                try:
+                    page = int(data.split("_")[2])
+                    await self.view_anime_ids(client, callback_query, page=page)
+                except Exception as e:
+                    logger.error(f"Error parsing view_ids page: {e}")
+                    await callback_query.answer("❌ Invalid page", show_alert=True)
+
             elif data == "admin_add_admin":
                 await self.add_admin_start(client, callback_query)
                 
@@ -6033,18 +6576,33 @@ class AnimeBot:
                 await message.reply_text("⚠️ User not found or not an admin")
         except Exception as e:
             await message.reply_text(f"❌ Error: {str(e)}")
+    # Add these methods to your AnimeBot class
+    async def start_health_server(self):
+        self.health_server = HealthCheckServer()
+        await self.health_server.start()
+    
+    async def stop_health_server(self):
+        if hasattr(self, 'health_server'):
+            await self.health_server.stop()
 
-    async def clear_expired_sessions(self):
-        now = datetime.now()
-        expired = []
-        for user_id, session in self.user_sessions.items():
-            if (now - session.get('last_activity', now)).total_seconds() > 3600:  # 1 hour
-                expired.append(user_id)
-        
-        for user_id in expired:
-            del self.user_sessions[user_id]
+async def check_force_sub(client: Client, user_id: int, message: Message = None) -> bool:
+    """Check if user has joined all required channels"""
+    if not bot.force_sub.force_sub_enabled or not bot.force_sub.force_sub_channels:
+        return True
 
- 
+    is_member = await bot.force_sub.check_member(client, user_id)
+
+    if not is_member and message:
+        force_sub_msg, keyboard = await bot.force_sub.get_force_sub_message(client)
+        await client.send_photo(
+            chat_id=message.chat.id,
+            photo="https://files.catbox.moe/ujbe17.jpeg",  # force start image
+            caption=force_sub_msg,
+            reply_markup=keyboard
+        )
+
+    return is_member
+
 
 async def check_expiry_periodically():
     """Periodically check and revoke expired premium access"""
@@ -6082,31 +6640,139 @@ async def check_available_periodically(client):
             logger.error(f"Error in check_available_periodically: {e}")
             await asyncio.sleep(600)
 
+class HealthCheckServer:
+    def __init__(self):
+        self.app = web.Application()
+        self.runner = None
+        self.site = None
+        self.port = 8000
+
+    async def health_check(self, request):
+        return web.Response(text="OK", status=200)
+
+    async def start(self):
+        self.app.add_routes([web.get('/healthz', self.health_check)])
+        self.runner = web.AppRunner(self.app)
+        await self.runner.setup()
+        self.site = web.TCPSite(self.runner, '0.0.0.0', self.port)
+        await self.site.start()
+        print(f"Health check server running on port {self.port}")
+
+    async def stop(self):
+        if self.site:
+            await self.site.stop()
+        if self.runner:
+            await self.runner.cleanup()
+async def shutdown(stop_event):
+    """Cleanup tasks tied to the service's shutdown."""
+    print("Shutting down gracefully...")
+
+    # Signal all tasks to stop
+    stop_event.set()
+
+    # Close health server
+    await bot.stop_health_server()
+
+    # Close database connections
+    if hasattr(bot, 'db'):
+        for client in bot.db.anime_clients:
+            client.close()
+        if hasattr(bot.db, 'users_client'):
+            bot.db.users_client.close()
+
+    print("Cleanup complete")
+
+async def run_until_stopped(client: Client, stop_event: asyncio.Event):
+    """Run the client until stop event is set"""
+    try:
+        await client.start()
+        print("Bot started successfully")
+        await stop_event.wait()
+    finally:
+        if client.is_connected:
+            await client.stop()
+
 async def main():
     global bot
     bot = AnimeBot()
+    
+    # Initialize everything first
     await bot.initialize()
     await bot.db.load_admins_and_owners()
 
+    # Start health server
+    await bot.start_health_server()
+
+    # Create the Pyrogram client
     app = Client(
         "AnimeFilterBot",
         api_id=Config.API_ID,
         api_hash=Config.API_HASH,
         bot_token=Config.BOT_TOKEN
     )
+    await bot.initialize(app)
 
-    # Start background tasks
-    asyncio.create_task(check_expiry_periodically())
-    asyncio.create_task(check_session_timeouts())
-    asyncio.create_task(check_available_periodically(app))
-    asyncio.create_task(bot.daily_reset_task())
 
+    # Register all handlers BEFORE starting the client
+    register_handlers(app)
+
+    try:
+        # Start the client
+        await app.start()
+        print("Bot started successfully")
+
+        # Start background tasks
+        tasks = [
+            asyncio.create_task(check_expiry_periodically()),
+            asyncio.create_task(check_session_timeouts()),
+            asyncio.create_task(check_available_periodically(app)),
+            asyncio.create_task(bot.daily_reset_task())
+        ]
+
+        # Keep the bot running
+        while True:
+            await asyncio.sleep(3600)  # Sleep for 1 hour
+
+    except Exception as e:
+        logger.error(f"Fatal error: {e}", exc_info=True)
+    finally:
+        # Cleanup
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await app.stop()
+        await bot.stop_health_server()
+        print("Bot shutdown complete")
+
+def register_handlers(app: Client):
+    """Register all message and callback handlers"""
     # Command handlers
     @app.on_message(filters.command("start") & (filters.private | (filters.group & filters.chat(Config.GROUP_ID) if Config.GROUP_ID else filters.group)))
     async def start_command(client: Client, message: Message):
-
-        await bot.start(client, message)
+        # 🔹 Check Force Sub first
+        # Force sub check for all private messages
+        if not await check_force_sub(client, message.from_user.id, message):
+            return
         
+        # ✅ Continue normal start flow
+        await bot.start(client, message)
+    @ app.on_message(filters.command("testforcesub") & filters.user(Config.ADMINS))
+    async def test_force_sub(client: Client, message: Message):
+        user_id = message.from_user.id
+        if len(message.command) > 1:
+            test_user_id = int(message.command[1])
+            user_id = test_user_id
+        
+        is_member = await bot.force_sub.check_member(client, user_id)
+        status = "✅ Subscribed" if is_member else "❌ Not subscribed"
+        
+        await message.reply_text(
+            f"Force Sub Test for user {user_id}:\n"
+            f"Status: {status}\n"
+            f"Enabled: {bot.force_sub.force_sub_enabled}\n"
+            f"Channels: {len(bot.force_sub.force_sub_channels)}"
+        )
+            
     @app.on_message(filters.command("broadcast") & filters.user(Config.ADMINS))
     async def broadcast_handler(client: Client, message: Message):
         await bot.broadcast.broadcast_message(client, message)
@@ -6187,7 +6853,7 @@ async def main():
             logger.error(f"Error unlinking sequels: {e}")
             await message.reply_text("❌ Error unlinking sequels")
 
-    @app.on_message(filters.command(["browse", "watchlist", "recent", "admin", "stats"]))
+    @app.on_message(filters.command(["index", "watchlist", "recent", "admin", "stats"]))
     async def handle_commands(client: Client, message: Message):
         try:
             # Basic rate-limiting check
@@ -6198,14 +6864,11 @@ async def main():
             command = message.command[0].lower()
 
             # Command handling logic
-            if command == "browse":
+            if command == "index":
                 await bot.browse_command(client, message)
 
             elif command == "watchlist":
                 await bot.watchlist_command(client, message)
-
-            elif command == "recent":
-                await bot.recent_command(client, message)
 
             elif command == "admin":
                 if message.from_user.id in Config.ADMINS:
@@ -6254,7 +6917,8 @@ async def main():
         help_text = Scripts.HELP_TEXT.format(
             bot_name=Config.BOT_NAME, 
             group_link=Config.GROUP_LINK,
-            delete_timer=Config.DELETE_TIMER_MINUTES
+            delete_timer=Config.DELETE_TIMER_MINUTES,
+            developer_link=Config.DEVELOPER_USERNAME
         )
 
         await message.reply_text(
@@ -6266,23 +6930,56 @@ async def main():
             ])
         )
         # React to the user's message with a random emoji
-       
-    @app.on_message(filters.command(["recent", "updates"]) & (filters.private | (filters.group & filters.chat(Config.GROUP_ID) if Config.GROUP_ID else filters.group)))
-    async def recent_command(client: Client, message: Message):
-        class FakeCallbackQuery:
-            def __init__(self, message):
-                self.from_user = message.from_user
-                self.message = message
-                self.data = 'recent_updates'
+    @ app.on_message(filters.command("forcesub") & filters.user(Config.ADMINS))
+    async def force_sub_command(client: Client, message: Message):
+        if len(message.command) > 1:
+            subcommand = message.command[1].lower()
+            
+            if subcommand == "on":
+                await bot.force_sub.toggle_force_sub(True)
+                await message.reply_text("✅ Force subscription enabled")
                 
-            async def answer(self, *args, **kwargs):
-                pass
+            elif subcommand == "off":
+                await bot.force_sub.toggle_force_sub(False)
+                await message.reply_text("✅ Force subscription disabled")
                 
-        fake_query = FakeCallbackQuery(message)
-        await bot.show_recent_updates(client, fake_query)
-        # React to the user's message with a random emoji
-       
-      
+            elif subcommand == "add" and len(message.command) > 2:
+                channel_id = message.command[2]
+                try:
+                    chat = await client.get_chat(channel_id)
+                    added = await bot.force_sub.add_channel(chat.id)
+                    if added:
+                        await message.reply_text(f"✅ Added channel: {chat.title}")
+                    else:
+                        await message.reply_text("ℹ️ Channel already in list")
+                except Exception as e:
+                    await message.reply_text(f"❌ Error: {e}")
+                    
+            elif subcommand == "remove" and len(message.command) > 2:
+                try:
+                    channel_id = int(message.command[2])
+                    removed = await bot.force_sub.remove_channel(channel_id)
+                    if removed:
+                        await message.reply_text("✅ Channel removed")
+                    else:
+                        await message.reply_text("❌ Channel not found")
+                except:
+                    await message.reply_text("❌ Invalid channel ID")
+                    
+            elif subcommand == "list":
+                await bot.force_sub.show_settings(client, message)
+                
+        else:
+            await message.reply_text(
+                "Usage: /forcesub <command>\n\n"
+                "Commands:\n"
+                "• on - Enable force sub\n"
+                "• off - Disable force sub\n"
+                "• add <channel> - Add channel\n"
+                "• remove <id> - Remove channel\n"
+                "• list - Show settings"
+            )
+        
     @app.on_message(filters.command("linksequel") & filters.private & filters.user(Config.ADMINS))
     async def link_sequel_command(client: Client, message: Message):
         if len(message.command) < 3:
@@ -6321,31 +7018,6 @@ async def main():
             await message.reply_text("✅ Successfully linked the sequels!")
         except Exception as e:
             logger.error(f"Error linking sequels: {e}")
-    @app.on_message(filters.command("episode") & filters.private & filters.user(Config.ADMINS))
-    async def set_episode_override(client: Client, message: Message):
-        try:
-            if len(message.command) < 2:
-                await message.reply_text("Usage: /episode <number>")
-                return
-                
-            if not message.reply_to_message:
-                await message.reply_text("Please reply to a file message")
-                return
-                
-            episode = int(message.command[1])
-            user_id = message.from_user.id
-            
-            if user_id not in bot.user_sessions:
-                bot.user_sessions[user_id] = {}
-                
-            bot.user_sessions[user_id]['manual_episode'] = episode
-            await message.reply_text(f"Episode set to {episode}. Now send the file again.")
-            
-        except ValueError:
-            await message.reply_text("Invalid episode number")
-        except Exception as e:
-            logger.error(f"Episode override error: {e}")
-            await message.reply_text("Error setting episode")
     @app.on_message(filters.command("resetdb") & filters.private & filters.user(Config.OWNERS))
     async def reset_db_command(client: Client, message: Message):
         class FakeCallbackQuery:
@@ -6359,7 +7031,10 @@ async def main():
                 
         fake_query = FakeCallbackQuery(message)
         await bot.reset_database_confirm(client, fake_query)
-
+    @app.on_message(filters.command("quote") & ( filters.group))
+    async def quote_command(client: Client, message: Message):
+        await bot.quotes.send_quote(client, message)
+ 
     @app.on_message(filters.command("addadmin") & filters.private & filters.user(Config.ADMINS))
     async def add_admin_command(client: Client, message: Message):
         if len(message.command) < 2:
@@ -6451,9 +7126,19 @@ async def main():
             elif state == "adding_db_channel":
                 await bot.process_db_channel_add(client, message)
                 return
-
+            elif state == "adding_force_sub_channel":
+                await bot.force_sub.process_add_channel(client, message)
+                return
+                
+            elif state == "removing_force_sub_channel":
+                await bot.force_sub.process_remove_channel(client, message)
+                return
+        
             # Handle session awaiting search
-            if bot.user_sessions[user_id].get("awaiting_search"):
+         # Check if user is awaiting search input
+      
+            if user_id in bot.user_sessions and bot.user_sessions[user_id].get('awaiting_search'):
+                del bot.user_sessions[user_id]['awaiting_search']
                 await bot.process_search(client, message)
                 return
 
@@ -6501,8 +7186,7 @@ async def main():
             anime_list = await bot.db.search_anime(query, Config.MAX_SEARCH_RESULTS)
 
             for anime in anime_list:
-                score = f"⭐ {anime.get('score')}" if anime.get('score') else ""
-                title = f"{anime['title']} ({anime.get('episodes', '?')} eps) {score}"
+                title = f"{anime['title']} ({anime.get('episodes', '?')} eps)"
 
                 results.append(
                     InlineQueryResultArticle(
@@ -6511,8 +7195,8 @@ async def main():
                             f"🔍 *Search result for '{query}':*\n\n"
                             f"🎬 *{anime['title']}*\n"
                             f"📺 *Episodes:* {anime.get('episodes', '?')}\n"
-                            f"🏢 *Studio:* {anime.get('studio', 'Unknown')}\n"
-                            f"{score}",
+                            f"🏢 *Studio:* {anime.get('studio', 'Unknown')}\n",
+                          
                             parse_mode=enums.ParseMode.MARKDOWN
                         ),
                         reply_markup=InlineKeyboardMarkup([[
@@ -6533,10 +7217,28 @@ async def main():
             print(f"Inline query error: {e}")
             logger.error(f"Error handling inline query: {e}")
 
-    logger.info("Starting AnimeFilterBot...")
-    await app.start()
-    await idle()
-    await app.stop()
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler('bot.log')
+        ]
+    )
+    
+    # Start the bot with auto-restart
+    while True:
+        try:
+            asyncio.run(main())
+        except KeyboardInterrupt:
+            asyncio.run(self.notification_manager.stop())
+
+            break
+        except Exception as e:
+            logger.error(f"Bot crashed: {e}", exc_info=True)
+            logger.info("Restarting in 10 seconds...")
+            time.sleep(10)
