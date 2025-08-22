@@ -5576,7 +5576,7 @@ class AnimeBot:
         try:
             keyboard = []
             row = []
-            for char in '0ABCDEFGHIJKLMNOPQRSTUVWXYZ':
+            for char in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ':
                 row.append(InlineKeyboardButton(char, callback_data=f"letter_{char}"))
                 if len(row) == 6:
                     keyboard.append(row)
