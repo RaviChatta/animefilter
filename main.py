@@ -1497,7 +1497,7 @@ class AnimeBot:
         try:
             keyboard = []
             row = []
-            for char in '0ABCDEFGHIJKLMNOPQRSTUVWXYZ':
+            for char in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ':
                 row.append(InlineKeyboardButton(char, callback_data=f"browse_{char}"))
                 if len(row) == 6:
                     keyboard.append(row)
@@ -1528,57 +1528,88 @@ class AnimeBot:
             logger.error(f"Error in browse command: {e}")
             await message.reply_text("⚠️ Error loading anime list. Please try again.")
 
+  
     async def watchlist_command(self, client: Client, message: Message):
         try:
             user_id = message.from_user.id
             watchlist = await self.db.get_watchlist(user_id, Config.MAX_WATCHLIST_ITEMS)
+    
             if not watchlist:
                 await message.reply_text(
-                    "⭐ Your watchlist is empty.\nAdd anime to your watchlist from their details page.",
+                    "⭐ Your watchlist is empty.\n"
+                    "Easily add anime to your watchlist from their details page.\n\n"
+                    "<blockquote>📝 Note: Add <b>ongoing anime</b> to your watchlist to get notified when new episodes are added!</blockquote>\n"
+                    "<blockquote>💡 Tip: Use the <code>/ongoing</code> command to see the current list of ongoing anime.</blockquote>",
                     reply_markup=InlineKeyboardMarkup([
-                        
                         [InlineKeyboardButton("📜 Browse Anime", callback_data="available_anime")]
-                    ]))
+                    ]),
+                    parse_mode=enums.ParseMode.HTML
+                )
                 return
-            
-            # Get status for each anime in watchlist
+    
+            # Enhance watchlist with status and episode counts
             enhanced_watchlist = []
             for item in watchlist:
                 anime = await self.db.find_anime(item['anime_id'])
                 if anime:
-                    status = anime.get('status', '').upper()
-                    item['status'] = status
-                    enhanced_watchlist.append(item)
-            
+                    status = anime.get("status", "").upper()
+                    try:
+                        total_uploaded = await self.db.count_episodes(anime["id"], count_unique=True)
+                    except Exception as e:
+                        logger.warning(f"Error counting episodes for anime {anime['id']}: {e}")
+                        total_uploaded = 0
+    
+                    anime_data = {
+                        "anime_id": anime["id"],
+                        "title": anime["title"],
+                        "status": status,
+                        "episodes": anime.get("episodes", "?"),
+                        "uploaded": total_uploaded
+                    }
+                    enhanced_watchlist.append(anime_data)
+    
+            # Build keyboard
             keyboard = []
             for item in enhanced_watchlist:
-                status_indicator = "🔄 " if item.get('status') == "RELEASING" else ""
+                status_indicator = "🔄 " if item.get("status") == "RELEASING" else ""
+    
+                if item.get("status") == "RELEASING":
+                    btn_text = f"{status_indicator}{item['title']} ({item['uploaded']}/{item['episodes']})"
+                else:
+                    btn_text = f"{status_indicator}{item['title']}"
+    
                 keyboard.append([
                     InlineKeyboardButton(
-                        f"{status_indicator}{item['title']}",
+                        btn_text,
                         callback_data=f"anime_{item['anime_id']}"
                     )
                 ])
-            
+    
+            # Pagination if more than 10
             if len(watchlist) > 10:
                 keyboard.append([
                     InlineKeyboardButton("◀️ Previous", callback_data="watchlist_prev"),
                     InlineKeyboardButton("▶️ Next", callback_data="watchlist_next")
                 ])
-                
+    
+            # Back & Close buttons
             keyboard.append([
                 InlineKeyboardButton("🔙 Back", callback_data="start_menu"),
                 InlineKeyboardButton("❌ Close", callback_data="close_message")
             ])
-            
+    
             await message.reply_text(
-                "⭐ Your Watchlist\n\n"
-                "🔄 = Currently releasing new episodes\n"
+                "<blockquote>⭐ <b>Your Watchlist</b></blockquote>\n\n"
+                "<blockquote>🔄 = Currently releasing new episodes<blockquote>\n"
                 "Select an anime to view details:",
-                reply_markup=InlineKeyboardMarkup(keyboard))
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode=enums.ParseMode.HTML
+            )
+    
         except Exception as e:
             logger.error(f"Error in watchlist command: {e}")
             await message.reply_text("⚠️ Error loading your watchlist. Please try again.")
+
     def clean_filename(filename):
         """Clean and normalize filename for better parsing"""
         # Remove release group tags
