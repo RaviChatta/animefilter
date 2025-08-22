@@ -1635,24 +1635,32 @@ class AnimeBot:
             )
     async def start(self, client: Client, message: Message):
         user_id = message.from_user.id
-        # Force subscription check - MUST be at the VERY BEGINNING
+
+        # Force subscription check
         if self.force_sub.force_sub_enabled and self.force_sub.force_sub_channels:
             if not await self.force_sub.check_member(client, user_id):
                 force_sub_msg, keyboard = await self.force_sub.get_force_sub_message(client)
-                await message.reply_text(force_sub_msg, reply_markup=keyboard)
+                await client.send_photo(
+                    chat_id=message.chat.id,
+                    photo=self.force_sub.force_sub_image,  # configurable image
+                    caption=force_sub_msg,
+                    reply_markup=keyboard
+                )
                 return
 
-        args = message.text.split(" ", 1)
+        # Safely get command args
+        text = message.text or message.caption
+        args = text.split(" ", 1) if text else []
+
         if len(args) > 1:
             try:
                 base64_string = args[1]
                 string = await decode(base64_string)
-                
+
                 if string.startswith("file_"):
                     file_id = string[5:]
                     await self.process_file_download(client, message, file_id)
                     return
-                    
                 elif string.startswith("bulk_"):
                     parts = string.split('_')
                     if len(parts) >= 3:
@@ -1660,11 +1668,11 @@ class AnimeBot:
                         anime_id = int(parts[2])
                         await self.process_file_download(client, message, f"bulk_{quality}_{anime_id}")
                         return
-                        
             except Exception as e:
                 logger.error(f"Error decoding start parameter: {e}")
-        
+
         user = message.from_user
+
         
         update_data = {
             "$setOnInsert": {
