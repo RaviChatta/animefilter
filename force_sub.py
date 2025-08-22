@@ -69,7 +69,7 @@ class ForceSub:
         if not self.force_sub_channels:
             return "Force subscribe is enabled but no channels are set!", None
 
-        message = "📢 **Join these channels to use the bot:**\n\n"
+        message = "📢 **Join these channels to use the bot:**\n"
         buttons = []
         valid_channels = 0
         
