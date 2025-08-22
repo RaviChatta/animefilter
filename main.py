@@ -1848,6 +1848,7 @@ class AnimeBot:
             logger.error(f"Error in search_anime: {e}")
             await message.reply_text("⚠️ Error initiating search. Please try again.")
 
+
     async def view_watchlist(self, client: Client, callback_query: CallbackQuery):
         user_id = callback_query.from_user.id
         try:
@@ -1855,7 +1856,7 @@ class AnimeBot:
             if not watchlist:
                 await callback_query.answer("Your watchlist is empty.", show_alert=True)
                 return
-            
+    
             keyboard = []
             for item in watchlist:
                 keyboard.append([
@@ -1864,19 +1865,27 @@ class AnimeBot:
                         callback_data=f"anime_{item['anime_id']}"
                     )
                 ])
-            
+    
             keyboard.append([
                 InlineKeyboardButton("🔙 Back", callback_data="start_menu"),
                 InlineKeyboardButton("❌ Close", callback_data="close_message")
             ])
-            
+    
             reply_markup = InlineKeyboardMarkup(keyboard)
-            
+    
+            text = (
+                "⭐ <b>Your Watchlist</b>\n\n"
+                "Select an anime to view details:\n\n"
+                "<blockquote>📝 Note: Add <b>ongoing anime</b> to your watchlist to get notified when new episodes are added!</blockquote>\n"
+                "<blockquote>💡 Tip: Use the <code>/ongoing</code> command to see the current list of ongoing anime.</blockquote>"
+            )
+    
             await self.update_message(
                 client,
                 callback_query.message,
-                "⭐ *Your Watchlist*\n\nSelect an anime to view details:",
-                reply_markup=reply_markup
+                text,
+                reply_markup=reply_markup,
+                parse_mode=enums.ParseMode.HTML
             )
         except Exception as e:
             logger.error(f"Error viewing watchlist: {e}")
