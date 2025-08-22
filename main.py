@@ -1529,6 +1529,7 @@ class AnimeBot:
             await message.reply_text("⚠️ Error loading anime list. Please try again.")
 
   
+
     async def watchlist_command(self, client: Client, message: Message):
         try:
             user_id = message.from_user.id
@@ -1547,10 +1548,24 @@ class AnimeBot:
                 )
                 return
     
-            # Enhance watchlist with status and episode counts
+            # --- Fetch releasing anime (for later use in ongoing command) ---
+            releasing_anime = []
+            for db_client in self.db.anime_clients:
+                try:
+                    db = db_client[self.db.db_name]
+                    cluster_results = await db.anime.find(
+                        {"status": "RELEASING"},
+                        {"id": 1, "title": 1, "episodes": 1, "last_updated": 1}
+                    ).sort("last_updated", -1).to_list(None)
+                    releasing_anime.extend(cluster_results)
+                except Exception as e:
+                    logger.warning(f"Error fetching releasing anime from cluster: {e}")
+                    continue
+    
+            # --- Enhance watchlist with status and episode counts ---
             enhanced_watchlist = []
             for item in watchlist:
-                anime = await self.db.find_anime(item['anime_id'])
+                anime = await self.db.find_anime(item["anime_id"])
                 if anime:
                     status = anime.get("status", "").upper()
                     try:
@@ -1568,7 +1583,7 @@ class AnimeBot:
                     }
                     enhanced_watchlist.append(anime_data)
     
-            # Build keyboard
+            # --- Build keyboard ---
             keyboard = []
             for item in enhanced_watchlist:
                 status_indicator = "🔄 " if item.get("status") == "RELEASING" else ""
@@ -1598,14 +1613,15 @@ class AnimeBot:
                 InlineKeyboardButton("❌ Close", callback_data="close_message")
             ])
     
+            # --- Final reply ---
             await message.reply_text(
                 "<blockquote>⭐ <b>Your Watchlist</b></blockquote>\n\n"
-                "<blockquote>🔄 = Currently releasing new episodes<blockquote>\n"
+                "<blockquote>🔄 = Currently releasing new episodes</blockquote>\n"
                 "Select an anime to view details:",
                 reply_markup=InlineKeyboardMarkup(keyboard),
                 parse_mode=enums.ParseMode.HTML
             )
-    
+
         except Exception as e:
             logger.error(f"Error in watchlist command: {e}")
             await message.reply_text("⚠️ Error loading your watchlist. Please try again.")
