@@ -3,6 +3,7 @@ import sys
 import re
 import uuid
 import random
+import time 
 import html
 import logging
 import aiohttp
@@ -10,13 +11,16 @@ import asyncio
 import json
 import base64
 import psutil
+import signal
+from aiohttp import web
 from typing import Dict, List, Optional, Tuple , Union, Set
+from collections import defaultdict
 from datetime import datetime, timedelta
 from pyrogram import Client as PyroClient
 from motor.motor_asyncio import AsyncIOMotorClient
 from aiohttp import ClientSession, ClientTimeout
 from pyrogram.enums import ParseMode
-from collections import defaultdict
+from aiohttp import web
 from pyrogram import Client, filters, enums
 from pyrogram.types import (
     InlineKeyboardButton, 
@@ -40,7 +44,7 @@ from bson import ObjectId
 from settings import config
 from scripts import Scripts
 from anime_quotes import AnimeQuotes
-
+from force_sub import ForceSub
 
 
 
@@ -917,19 +921,20 @@ class Config:
     ADULT_CONTENT_TYPES = ['ADULT', 'HENTAI']
 
 async def encode(string: str) -> str:
-    string_bytes = string.encode("ascii")
+    string_bytes = string.encode("utf-8")  # ✅ utf-8 supports all chars
     base64_bytes = base64.urlsafe_b64encode(string_bytes)
-    return base64_bytes.decode("ascii")
+    return base64_bytes.decode("utf-8")
 
 async def decode(base64_string: str) -> str:
-    base64_bytes = base64_string.encode("ascii")
+    base64_bytes = base64_string.encode("utf-8")
     string_bytes = base64.urlsafe_b64decode(base64_bytes)
-    return string_bytes.decode("ascii")
-
+    return string_bytes.decode("utf-8")
+# Add this class definition near your other class definitions
+# Add these imports at the top of your file
 # Add this class definition near your other class definitions
 class NotificationManager:
-    def __init__(self, bot):
-        self.bot = bot
+    def __init__(self, bot_instance):
+        self.bot_instance = bot_instance  # Reference to the main bot instance
         self.pending_notifications = defaultdict(lambda: defaultdict(set))  # anime_id -> episode -> set(user_ids)
         self.notification_lock = asyncio.Lock()
         self.processing_task = None
@@ -978,12 +983,12 @@ class NotificationManager:
         """Send a notification to multiple users about a new episode"""
         try:
             # Get anime details
-            anime = await self.bot.db.find_anime(anime_id)
+            anime = await self.bot_instance.db.find_anime(anime_id)
             if not anime:
                 return
                 
             # Get available qualities for this episode
-            files = await self.bot.db.find_files(anime_id, episode)
+            files = await self.bot_instance.db.find_files(anime_id, episode)
             qualities = set()
             for file in files:
                 if 'quality' in file:
@@ -1005,7 +1010,8 @@ class NotificationManager:
             async def send_single_notification(user_id):
                 async with semaphore:
                     try:
-                        await self.bot.bot.send_message(
+                        # Use the Pyrogram client directly from the bot instance
+                        await self.bot_instance.app.send_message(
                             chat_id=user_id,
                             text=message,
                             parse_mode=enums.ParseMode.MARKDOWN
@@ -1031,6 +1037,8 @@ class AnimeBot:
         self.config = Config()
         self.db = Database()
         self.notification_manager = NotificationManager(self)
+        self.app = None  # We'll set this when the client starts
+        self.force_sub = ForceSub(self.db, self)  # Pass self as bot_instance
         self.broadcast = Broadcast(self.db, self.config)
         self.request_system = RequestSystem(self)
         self.user_sessions = {}
@@ -1110,18 +1118,6 @@ class AnimeBot:
             r'\b(\d{2,3})\b',                # Standalone 13
             r'第(\d+)話',                    # Japanese notation
             r'第(\d+)集'                     # Chinese notation
-                # NEW PATTERNS TO ADD:
-            r'\[S(\d+)\s+E(\d+)\]',          # [S01 E17] - NEW
-            r'\[Season\s*(\d+)\s*Episode\s*(\d+)\]',  # [Season 1 Episode 5]
-            r'\bS(\d+)\s*E(\d+)\b',          # S01 E17 - NEW
-            r'\[(\d+)\s*of\s*\d+\]',         # [01 of 12]
-            r'Movie',                        # Movie keyword - NEW
-            r'\[Movie\]',                    # [Movie] - NEW
-            r'\(\s*Movie\s*\)',              # (Movie) - NEW
-            r'Complete\s*Movie',             # Complete Movie - NEW
-            r'Full\s*Movie',                 # Full Movie - NEW
-            r'劇場版',                       # Japanese for "Movie Edition"
-            r'Feature\s*Film'               # Feature Film
         
         ]
         self.season_patterns = [
@@ -1137,10 +1133,12 @@ class AnimeBot:
         ]
 
 
-    async def initialize(self):
+    async def initialize(self, app=None):
+        if app:
+            self.app = app  # Store the Pyrogram client
         await self.db.initialize()
-        await self.notification_manager.start()  # Start notification processing
-
+        await self.force_sub.initialize()  # Add this line
+        await self.notification_manager.start() # Start notification processing
         asyncio.create_task(self.premium.validate_cache_periodically())
     def get_user_session(self, user_id: int, message_id: int = None):
         """Get user session data with automatic cleanup"""
@@ -1559,74 +1557,53 @@ class AnimeBot:
         # Remove multiple spaces
         filename = ' '.join(filename.split())
         return filename.strip()
-
-    def is_movie_file(self, filename: str, caption: str = "") -> bool:
-        """Check if file is a movie based on filename patterns"""
-        combined_text = f"{filename} {caption}".lower()
-        
-        movie_patterns = [
-            r'\bmovie\b',
-            r'\bfilm\b', 
-            r'complete movie',
-            r'full movie',
-            r'劇場版',
-            r'movie edition',
-            r'feature film',
-            r'\[movie\]',
-            r'\(movie\)',
-            r'-\s*movie\s*-'
-        ]
-        
-        return any(re.search(pattern, combined_text, re.IGNORECASE) for pattern in movie_patterns)
     async def extract_episode_number(self, message: Message, anime_type: str) -> Optional[int]:
         # Get filename and caption
-        file_name = (
-            message.document.file_name if message.document else
-            message.video.file_name if message.video else
-            ""
-        )
+        file_name = message.document.file_name if message.document else message.video.file_name if message.video else ""
         caption = message.caption or ""
         combined_text = f"{file_name} {caption}".lower()
 
-        # Normalize brackets and whitespace
+        # Normalize: remove brackets and extra spaces
         combined_text = re.sub(r'[\[\](){}]', ' ', combined_text)
-        combined_text = re.sub(r'[-–—]', '-', combined_text)  # normalize dashes
         combined_text = re.sub(r'\s+', ' ', combined_text).strip()
 
-        print(f"[DEBUG] Combined text: {combined_text}")  # 👈 DEBUG line
-
-        # Force treat as movie if filename/caption indicates it
-        if 'movie' in combined_text or '劇場版' in combined_text:
-            print("[DEBUG] Detected as movie")  # 👈 DEBUG line
-            return 1
-
-        # Get config
+        # First check if this is a movie/single-file type from config
         type_info = Config.ANIME_TYPES.get(anime_type.upper(), {})
-        has_episodes = type_info.get('has_episodes', True)
+        if not type_info.get('has_episodes', True):
+            return 1  # Default to episode 1 for non-episodic content
 
-        if isinstance(has_episodes, bool) and not has_episodes:
+        # Movie detection patterns (expanded)
+        movie_patterns = [
+            r'\bmovie\b', r'\bfilm\b', r'complete movie', r'full movie',
+            r'劇場版', r'movie edition', r'feature film',
+            r'\bs00\b',                              # Treat S00 as movie/special
+            r's\d+\s*[-~]?\s*movie',                 # S01 - Movie, S00-Movie
+            r'.*?\bmovie\b.*?',                      # any phrase with "movie"
+        ]
+
+        # If any movie pattern matches, return episode 1
+        if any(re.search(pattern, combined_text, re.IGNORECASE) for pattern in movie_patterns):
             return 1
 
         # Episode number patterns
         patterns = [
-            r'\[S\d+\s*[-~]\s*E(\d+)\]',
-            r'\bS\d+\s*[-~]\s*E(\d+)\b',
-            r'\[S\d+\s*[ -]?E(\d+)\]',
-            r'\bS\d+\s*[ -]?E(\d+)\b',
-            r'\[E(\d+)\]',
-            r'S\d+E(\d+)',
-            r'OVA\s*[-~]?\s*(\d{1,3})',
-            r'Episode\s*(\d+)',
-            r'Ep\s*(\d+)',
-            r'-\s*(\d{2,3})\s*-',
-            r'_\s*(\d{2,3})\s*_',
-            r'\[\s*(\d+)\s*\]',
-            r'\(\s*(\d+)\s*\)',
-            r'\b(\d{2,3})\b',
-            r'第(\d+)話',
-            r'第(\d+)集'
+            r'\[S\d+\s*[-~]\s*E(\d+)\]',     # [S01-E13]
+            r'\bS\d+\s*[-~]\s*E(\d+)\b',     # S01 - E13
+            r'\[E(\d+)\]',                   # [E13]
+            r'S\d+E(\d+)',                   # S01E13
+            r'OVA\s*[-~]?\s*(\d{1,3})',      # OVA - 05
+            r'Episode\s*(\d+)',              # Episode 13
+            r'Ep\s*(\d+)',                   # Ep 13
+            r'-\s*(\d{2,3})\s*-',            # - 13 -
+            r'_\s*(\d{2,3})\s*_',            # _13_
+            r'\[\s*(\d+)\s*\]',              # [13]
+            r'\(\s*(\d+)\s*\)',              # (13)
+            r'\b(\d{2,3})\b',                # Standalone 13
+            r'第(\d+)話',                    # Japanese notation
+            r'第(\d+)集'                     # Chinese notation
         ]
 
+        # Try matching episode numbers
         for pattern in patterns:
             match = re.search(pattern, combined_text, re.IGNORECASE)
             if match:
@@ -1635,10 +1612,11 @@ class AnimeBot:
                 except (ValueError, IndexError):
                     continue
 
+        # Special case: season markers but no episode number
         if re.search(r'\bS\d+\b', combined_text, re.IGNORECASE):
             return 1
 
-        return None  # fallback
+        return None  # Nothing matched
     async def send_formatted_message(client, chat_id, text, reply_markup=None):
         try:
             return await client.send_message(
@@ -1656,17 +1634,33 @@ class AnimeBot:
                 reply_markup=reply_markup
             )
     async def start(self, client: Client, message: Message):
-        args = message.text.split(" ", 1)
+        user_id = message.from_user.id
+
+        # Force subscription check
+        if self.force_sub.force_sub_enabled and self.force_sub.force_sub_channels:
+            if not await self.force_sub.check_member(client, user_id):
+                force_sub_msg, keyboard = await self.force_sub.get_force_sub_message(client)
+                await client.send_photo(
+                    chat_id=message.chat.id,
+                    photo=self.force_sub.force_sub_image,  # configurable image
+                    caption=force_sub_msg,
+                    reply_markup=keyboard
+                )
+                return
+
+        # Safely get command args
+        text = message.text or message.caption
+        args = text.split(" ", 1) if text else []
+
         if len(args) > 1:
             try:
                 base64_string = args[1]
                 string = await decode(base64_string)
-                
+
                 if string.startswith("file_"):
                     file_id = string[5:]
                     await self.process_file_download(client, message, file_id)
                     return
-                    
                 elif string.startswith("bulk_"):
                     parts = string.split('_')
                     if len(parts) >= 3:
@@ -1674,11 +1668,11 @@ class AnimeBot:
                         anime_id = int(parts[2])
                         await self.process_file_download(client, message, f"bulk_{quality}_{anime_id}")
                         return
-                        
             except Exception as e:
                 logger.error(f"Error decoding start parameter: {e}")
-        
+
         user = message.from_user
+
         
         update_data = {
             "$setOnInsert": {
@@ -2130,199 +2124,203 @@ class AnimeBot:
             logger.error(f"Error in show_bulk_quality_menu: {e}")
             await callback_query.answer("Error loading quality options.", show_alert=True)
     async def process_bulk_download(self, client: Client, callback_query: CallbackQuery, anime_id: int, quality: str):
-    """Handle bulk download with proper restrictions"""
-    user_id = callback_query.from_user.id
-    
-    try:
-        # First check if user has started the bot in PM
+        """Handle bulk download with proper restrictions"""
+        user_id = callback_query.from_user.id
+          # Force sub check
+        if not await check_force_sub(client, user_id, callback_query.message):
+            return
+        
         try:
-            user_chat = await client.get_chat(user_id)
-            if not user_chat or user_chat.type != ChatType.PRIVATE:
-                raise Exception("User not started bot in PM")
-        except Exception as pm_error:
-            await callback_query.answer(
-                "⚠️ Please start me in PM first to receive files!",
-                show_alert=True
-            )
-            # Optionally send a message with start button
-            start_button = InlineKeyboardMarkup([[
-                InlineKeyboardButton("Start Bot", url=f"https://t.me/{client.me.username}?start=start")
-            ]])
-            await callback_query.message.reply_text(
-                "Please start me in private chat to download files:",
-                reply_markup=start_button
-            )
-            return
-
-        # Check download limits FIRST if premium mode is ON
-        if self.config.PREMIUM_MODE:
-            can_download, limit_msg = await self.check_download_limit(user_id)
-            if not can_download:
-                await callback_query.answer(limit_msg, show_alert=True)
-                return
-        
-        # Then check adult content restrictions
-        anime = await self.db.find_anime(anime_id)
-        if not anime:
-            await callback_query.answer("Anime not found.", show_alert=True)
-            return
-
-        if anime.get('is_adult'):
-            if self.config.RESTRICT_ADULT:
-                if not await self.premium.check_access(user_id, 'hpremium'):
-                    await callback_query.answer(
-                        "🔞 Adult content requires H-Premium subscription!",
-                        show_alert=True
-                    )
-                    return
-            elif self.config.PREMIUM_MODE:
-                if not await self.premium.check_access(user_id, 'premium'):
-                    await callback_query.answer(
-                        "🔒 Content requires premium subscription!",
-                        show_alert=True
-                    )
-                    return
-        
-        # Get all files for this anime and quality
-        all_files = []
-        for db_client in self.db.anime_clients:
+            # First check if user has started the bot in PM
             try:
-                db = db_client[self.db.db_name]
-                files = await db.files.find({
-                    "anime_id": anime_id,
-                    "quality": quality.lower()
-                }).sort("episode", 1).to_list(None)
-                if files:
-                    all_files.extend(files)
-            except Exception as e:
-                logger.error(f"Error fetching files from cluster {db_client}: {str(e)}")
-                continue
-
-        if not all_files:
-            await callback_query.answer(f"No {quality.upper()} episodes found!", show_alert=True)
-            return
-
-        # Send processing message
-        processing_msg = await callback_query.message.reply_text(
-            f"⏳ Preparing to send {len(all_files)} {quality.upper()} episodes of {anime['title']}..."
-        )
-
-        success_count = 0
-        errors = []
-        
-        for file_info in all_files:
-            try:
-                # Double-check adult content restrictions for each file
-                if file_info.get('is_adult'):
-                    if self.config.RESTRICT_ADULT:
-                        if not await self.premium.check_access(user_id, 'hpremium'):
-                            errors.append(f"Ep {file_info.get('episode')} (Adult)")
-                            continue
-                    elif self.config.PREMIUM_MODE:
-                        if not await self.premium.check_access(user_id, 'premium'):
-                            errors.append(f"Ep {file_info.get('episode')} (Premium)")
-                            continue
-
-                # Get the original message with the file
-                msg = await client.get_messages(
-                    chat_id=file_info['chat_id'],
-                    message_ids=file_info['message_id']
-                )
-
-                if not msg:
-                    errors.append(f"Ep {file_info.get('episode')} (Missing)")
-                    continue
-
-                # Create caption
-                caption = (
-                    f"🎬 <b>{anime['title']} - Episode {file_info['episode']} "
-                    f"[{file_info['quality'].upper()}]</b>\n"
-                    f"💾 <b>Size:</b> {file_info['file_size']}"
-                )
-
-                # Send file based on type
-                try:
-                    if file_info['file_type'] == 'video':
-                        sent_msg = await client.send_video(
-                            chat_id=user_id,
-                            video=msg.video.file_id,
-                            caption=caption,
-                            parse_mode=enums.ParseMode.HTML,
-                            protect_content=Config.PROTECT_CONTENT
-                        )
-                    else:
-                        sent_msg = await client.send_document(
-                            chat_id=user_id,
-                            document=msg.document.file_id,
-                            caption=caption,
-                            parse_mode=enums.ParseMode.HTML,
-                            protect_content=Config.PROTECT_CONTENT
-                        )
-
-                    # Schedule deletion
-                    asyncio.create_task(
-                        self.delete_message_after_delay(
-                            client,
-                            user_id,
-                            sent_msg.id,
-                            Config.DELETE_TIMER_MINUTES * 60
-                        )
-                    )
-
-                    # Update stats
-                    await self.update_stats("total_downloads")
-                    success_count += 1
-                    await self.db.users_collection.update_one(
-                        {"user_id": user_id},
-                        {"$inc": {"download_count": 1}}
-                    )
-
-                    # Small delay between sends
-                    await asyncio.sleep(0.5)
-
-                except Exception as send_error:
-                    logger.error(f"Failed to send episode {file_info.get('episode')}: {str(send_error)}")
-                    errors.append(f"Ep {file_info.get('episode')} (Send Failed)")
-                    continue
-
-            except Exception as file_error:
-                logger.error(f"Error processing file {file_info.get('_id')}: {str(file_error)}")
-                errors.append(f"Ep {file_info.get('episode')} (Error)")
-                continue
-
-        # Send final status
-        try:
-            await processing_msg.delete()
-            
-            result_msg = (
-                f"<blockquote>\n"
-                f"Successfully sent {success_count}/{len(all_files)} episodes!<br>\n"
-                f"Files will auto-delete in {Config.DELETE_TIMER_MINUTES} minute(s).\n"
-                f"</blockquote>"
-            )
-
-            if errors:
-                result_msg += f"\n\nFailed episodes: {', '.join(errors[:10])}" + ("..." if len(errors) > 10 else "")
-            
-            # Always send the result to PM
-            await client.send_message(
-                chat_id=user_id,
-                text=result_msg
-            )
-            
-            # If the command was used in a group, show alert
-            if callback_query.message.chat.type != ChatType.PRIVATE:
+                user_chat = await client.get_chat(user_id)
+                if not user_chat or user_chat.type != ChatType.PRIVATE:
+                    raise Exception("User not started bot in PM")
+            except Exception as pm_error:
                 await callback_query.answer(
-                    f"📤 Sent {success_count}/{len(all_files)} episodes to your PM!",
+                    "⚠️ Please start me in PM first to receive files!",
                     show_alert=True
                 )
+                # Optionally send a message with start button
+                start_button = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("Start Bot", url=f"https://t.me/{client.me.username}?start=start")
+                ]])
+                await callback_query.message.reply_text(
+                    "Please start me in private chat to download files:",
+                    reply_markup=start_button
+                )
+                return
 
-        except Exception as final_error:
-            logger.error(f"Error sending final message: {str(final_error)}")
+            # Check download limits FIRST if premium mode is ON
+            if self.config.PREMIUM_MODE:
+                can_download, limit_msg = await self.check_download_limit(user_id)
+                if not can_download:
+                    await callback_query.answer(limit_msg, show_alert=True)
+                    return
+            
+            # Then check adult content restrictions
+            anime = await self.db.find_anime(anime_id)
+            if not anime:
+                await callback_query.answer("Anime not found.", show_alert=True)
+                return
 
-    except Exception as main_error:
-        logger.critical(f"Bulk download failed: {str(main_error)}")
-        await callback_query.answer("❌ Failed to process bulk download", show_alert=True)      
+            if anime.get('is_adult'):
+                if self.config.RESTRICT_ADULT:
+                    if not await self.premium.check_access(user_id, 'hpremium'):
+                        await callback_query.answer(
+                            "🔞 Adult content requires H-Premium subscription!",
+                            show_alert=True
+                        )
+                        return
+                elif self.config.PREMIUM_MODE:
+                    if not await self.premium.check_access(user_id, 'premium'):
+                        await callback_query.answer(
+                            "🔒 Content requires premium subscription!",
+                            show_alert=True
+                        )
+                        return
+            
+            # Get all files for this anime and quality
+            all_files = []
+            for db_client in self.db.anime_clients:
+                try:
+                    db = db_client[self.db.db_name]
+                    files = await db.files.find({
+                        "anime_id": anime_id,
+                        "quality": quality.lower()
+                    }).sort("episode", 1).to_list(None)
+                    if files:
+                        all_files.extend(files)
+                except Exception as e:
+                    logger.error(f"Error fetching files from cluster {db_client}: {str(e)}")
+                    continue
+
+            if not all_files:
+                await callback_query.answer(f"No {quality.upper()} episodes found!", show_alert=True)
+                return
+
+            # Send processing message
+            processing_msg = await callback_query.message.reply_text(
+                f"⏳ Preparing to send {len(all_files)} {quality.upper()} episodes of {anime['title']}..."
+            )
+
+            success_count = 0
+            errors = []
+            
+            for file_info in all_files:
+                try:
+                    # Double-check adult content restrictions for each file
+                    if file_info.get('is_adult'):
+                        if self.config.RESTRICT_ADULT:
+                            if not await self.premium.check_access(user_id, 'hpremium'):
+                                errors.append(f"Ep {file_info.get('episode')} (Adult)")
+                                continue
+                        elif self.config.PREMIUM_MODE:
+                            if not await self.premium.check_access(user_id, 'premium'):
+                                errors.append(f"Ep {file_info.get('episode')} (Premium)")
+                                continue
+
+                    # Get the original message with the file
+                    msg = await client.get_messages(
+                        chat_id=file_info['chat_id'],
+                        message_ids=file_info['message_id']
+                    )
+
+                    if not msg:
+                        errors.append(f"Ep {file_info.get('episode')} (Missing)")
+                        continue
+
+                    # Create caption
+                    caption = (
+                        f"🎬 <b>{anime['title']} - Episode {file_info['episode']} "
+                        f"[{file_info['quality'].upper()}]</b>\n"
+                        f"💾 <b>Size:</b> {file_info['file_size']}"
+                    )
+
+                    # Send file based on type
+                    try:
+                        if file_info['file_type'] == 'video':
+                            sent_msg = await client.send_video(
+                                chat_id=user_id,
+                                video=msg.video.file_id,
+                                caption=caption,
+                                parse_mode=enums.ParseMode.HTML,
+                                protect_content=Config.PROTECT_CONTENT
+                            )
+                        else:
+                            sent_msg = await client.send_document(
+                                chat_id=user_id,
+                                document=msg.document.file_id,
+                                caption=caption,
+                                parse_mode=enums.ParseMode.HTML,
+                                protect_content=Config.PROTECT_CONTENT
+                            )
+
+                        # Schedule deletion
+                        asyncio.create_task(
+                            self.delete_message_after_delay(
+                                client,
+                                user_id,
+                                sent_msg.id,
+                                Config.DELETE_TIMER_MINUTES * 60
+                            )
+                        )
+
+                        # Update stats
+                        await self.update_stats("total_downloads")
+                        success_count += 1
+                        await self.db.users_collection.update_one(
+                            {"user_id": user_id},
+                            {"$inc": {"download_count": 1}}
+                        )
+
+                        # Small delay between sends
+                        await asyncio.sleep(0.5)
+
+                    except Exception as send_error:
+                        logger.error(f"Failed to send episode {file_info.get('episode')}: {str(send_error)}")
+                        errors.append(f"Ep {file_info.get('episode')} (Send Failed)")
+                        continue
+
+                except Exception as file_error:
+                    logger.error(f"Error processing file {file_info.get('_id')}: {str(file_error)}")
+                    errors.append(f"Ep {file_info.get('episode')} (Error)")
+                    continue
+
+            # Send final status
+            try:
+                await processing_msg.delete()
+                
+                result_msg = (
+                    f"<blockquote>\n"
+                    f"Successfully sent {success_count}/{len(all_files)} episodes!<br>\n"
+                    f"Files will auto-delete in {Config.DELETE_TIMER_MINUTES} minute(s).\n"
+                    f"</blockquote>"
+                )
+
+                if errors:
+                    result_msg += f"\n\nFailed episodes: {', '.join(errors[:10])}" + ("..." if len(errors) > 10 else "")
+                
+                # Always send the result to PM
+                await client.send_message(
+                    chat_id=user_id,
+                    text=result_msg
+                )
+                
+                # If the command was used in a group, show alert
+                if callback_query.message.chat.type != ChatType.PRIVATE:
+                    await callback_query.answer(
+                        f"📤 Sent {success_count}/{len(all_files)} episodes to your PM!",
+                        show_alert=True
+                    )
+
+            except Exception as final_error:
+                logger.error(f"Error sending final message: {str(final_error)}")
+
+        except Exception as main_error:
+            logger.critical(f"Bulk download failed: {str(main_error)}")
+            await callback_query.answer("❌ Failed to process bulk download", show_alert=True)   
+
     async def show_episode_options(self, client: Client, callback_query: CallbackQuery, anime_id: int, episode: int):
         user_id = callback_query.from_user.id
         if user_id not in self.user_sessions or 'current_anime' not in self.user_sessions[user_id]:
@@ -2384,7 +2382,7 @@ class AnimeBot:
             )
         except Exception as e:
             logger.error(f"Error fetching episode files: {e}")
-            await callback_query.answer("⚠️ Error fetching files.", show_alert=True)
+            await callback_query.answer("⚠️ Error fetching files.", show_alert=True)   
     async def process_file_download(self, client: Client, message: Message, file_id: str):
         """Handle file downloads with proper restrictions and error handling"""
         user_id = message.from_user.id
@@ -2531,7 +2529,9 @@ class AnimeBot:
     async def download_episode_file(self, client: Client, callback_query: CallbackQuery, file_id: str):
         """Handle file downloads from callback queries"""
         user_id = callback_query.from_user.id
-        
+        # Force sub check
+        if not await check_force_sub(client, user_id, callback_query.message):
+            return
         try:
             # Handle bulk download requests
             if file_id.startswith("bulk_"):
@@ -2818,7 +2818,9 @@ class AnimeBot:
                     InlineKeyboardButton("🗑 Remove DB Channel", callback_data="admin_remove_db_channel")
                 ],
                 [
-                    InlineKeyboardButton("📮 View Requests", callback_data="requests_page:1")
+                    InlineKeyboardButton("📮 View Requests", callback_data="requests_page:1"),
+                    InlineKeyboardButton("📢 Force Subscription", callback_data="force_sub_settings")
+
                 ],
                 [
                     InlineKeyboardButton("🔗 Link Sequel", callback_data="admin_link_sequel"),
@@ -4627,10 +4629,10 @@ class AnimeBot:
             success = await self.db.insert_file(file_data)
             if not success:
                 raise Exception("Failed to insert file into database")
-            
+
             logger.info(f"Inserted file data: {file_data}")
             await self.update_stats("total_files")
-            
+
             await message.reply_text(
                 f"✅ *Added file for*:\n"
                 f"Anime: {anime_title}\n"
@@ -4643,14 +4645,20 @@ class AnimeBot:
                 f"🆔 *File ID:* `{file_data['_id']}`",
                 parse_mode=enums.ParseMode.MARKDOWN
             )
-            
+                    
             # Notify users in watchlist
             watchlist_users = await self.db.watchlist_collection.distinct(
                 "user_id", 
-                {"anime_id": anime_id}
+                {"anime_id": file_data["anime_id"]}
             )
+            
+            # Add notifications for all users
             for user_id in watchlist_users:
-                await self.notification_manager.add_notification(anime_id, episode, user_id)
+                await self.notification_manager.add_notification(
+                    file_data["anime_id"], 
+                    file_data["episode"], 
+                    user_id
+                )
 
         except Exception as e:
             logger.error(f"File processing error: {e}")
@@ -5294,6 +5302,12 @@ class AnimeBot:
             )
 
     async def process_search(self, client: Client, message: Union[Message, CallbackQuery], page: int = 1):
+        # Add force sub check
+        user_id = message.from_user.id if isinstance(message, Message) else message.from_user.id
+    
+        # Force sub check
+        if not await check_force_sub(client, user_id, message if isinstance(message, Message) else message.message):
+            return
         try:
             user_id = message.from_user.id
             
@@ -6030,6 +6044,41 @@ class AnimeBot:
                     await callback_query.message.delete()
                 await self.premium.show_my_plan(client, callback_query.message)
             # ========================
+            #  Forcesub Handlers
+            # ========================
+
+
+                # Add force subscription handlers
+            elif data == "check_force_sub":
+                joined = await self.force_sub.check_member(client, user_id)
+                if joined:
+                    await callback_query.answer("✅ Thanks for joining!", show_alert=True)
+                    await callback_query.message.delete()
+                    # Restart the command they were trying to access
+                    await self.start(client, callback_query.message)
+                else:
+                    await callback_query.answer("❗ You're still missing one or more channels.", show_alert=True)
+                return
+                
+            elif data == "force_sub_settings":
+                await self.force_sub.show_settings(client, callback_query.message)
+                return
+                
+            elif data == "toggle_force_sub":
+                await self.force_sub.toggle_force_sub(not self.force_sub.force_sub_enabled)
+                await self.force_sub.show_settings(client, callback_query.message)
+                return
+                
+            elif data == "add_force_sub_channel":
+                await callback_query.message.delete()
+                await self.force_sub.add_channel_start(client, callback_query.message)
+                return
+                
+            elif data == "remove_force_sub_channel":
+                await callback_query.message.delete()
+                await self.force_sub.remove_channel_start(client, callback_query.message)
+                return
+            # ========================
             # ⚙️ Settings Handlers
             # ========================
             elif data == "admin_settings" or data.startswith(("set_", "setval_")):
@@ -6535,8 +6584,34 @@ class AnimeBot:
                 await message.reply_text("⚠️ User not found or not an admin")
         except Exception as e:
             await message.reply_text(f"❌ Error: {str(e)}")
+    # Add these methods to your AnimeBot class
+    async def start_health_server(self):
+        self.health_server = HealthCheckServer()
+        await self.health_server.start()
+    
+    async def stop_health_server(self):
+        if hasattr(self, 'health_server'):
+            await self.health_server.stop()
 
-  
+async def check_force_sub(client: Client, user_id: int, message: Message = None) -> bool:
+    """Check if user has joined all required channels"""
+    if not bot.force_sub.force_sub_enabled or not bot.force_sub.force_sub_channels:
+        return True
+
+    is_member = await bot.force_sub.check_member(client, user_id)
+
+    if not is_member and message:
+        force_sub_msg, keyboard = await bot.force_sub.get_force_sub_message(client)
+        await client.send_photo(
+            chat_id=message.chat.id,
+            photo="https://files.catbox.moe/ujbe17.jpeg",  # force start image
+            caption=force_sub_msg,
+            reply_markup=keyboard
+        )
+
+    return is_member
+
+
 async def check_expiry_periodically():
     """Periodically check and revoke expired premium access"""
     while True:
@@ -6573,31 +6648,139 @@ async def check_available_periodically(client):
             logger.error(f"Error in check_available_periodically: {e}")
             await asyncio.sleep(600)
 
+class HealthCheckServer:
+    def __init__(self):
+        self.app = web.Application()
+        self.runner = None
+        self.site = None
+        self.port = 8000
+
+    async def health_check(self, request):
+        return web.Response(text="OK", status=200)
+
+    async def start(self):
+        self.app.add_routes([web.get('/healthz', self.health_check)])
+        self.runner = web.AppRunner(self.app)
+        await self.runner.setup()
+        self.site = web.TCPSite(self.runner, '0.0.0.0', self.port)
+        await self.site.start()
+        print(f"Health check server running on port {self.port}")
+
+    async def stop(self):
+        if self.site:
+            await self.site.stop()
+        if self.runner:
+            await self.runner.cleanup()
+async def shutdown(stop_event):
+    """Cleanup tasks tied to the service's shutdown."""
+    print("Shutting down gracefully...")
+
+    # Signal all tasks to stop
+    stop_event.set()
+
+    # Close health server
+    await bot.stop_health_server()
+
+    # Close database connections
+    if hasattr(bot, 'db'):
+        for client in bot.db.anime_clients:
+            client.close()
+        if hasattr(bot.db, 'users_client'):
+            bot.db.users_client.close()
+
+    print("Cleanup complete")
+
+async def run_until_stopped(client: Client, stop_event: asyncio.Event):
+    """Run the client until stop event is set"""
+    try:
+        await client.start()
+        print("Bot started successfully")
+        await stop_event.wait()
+    finally:
+        if client.is_connected:
+            await client.stop()
+
 async def main():
     global bot
     bot = AnimeBot()
+    
+    # Initialize everything first
     await bot.initialize()
     await bot.db.load_admins_and_owners()
 
+    # Start health server
+    await bot.start_health_server()
+
+    # Create the Pyrogram client
     app = Client(
         "AnimeFilterBot",
         api_id=Config.API_ID,
         api_hash=Config.API_HASH,
         bot_token=Config.BOT_TOKEN
     )
+    await bot.initialize(app)
 
-    # Start background tasks
-    asyncio.create_task(check_expiry_periodically())
-    asyncio.create_task(check_session_timeouts())
-    asyncio.create_task(check_available_periodically(app))
-    asyncio.create_task(bot.daily_reset_task())
 
+    # Register all handlers BEFORE starting the client
+    register_handlers(app)
+
+    try:
+        # Start the client
+        await app.start()
+        print("Bot started successfully")
+
+        # Start background tasks
+        tasks = [
+            asyncio.create_task(check_expiry_periodically()),
+            asyncio.create_task(check_session_timeouts()),
+            asyncio.create_task(check_available_periodically(app)),
+            asyncio.create_task(bot.daily_reset_task())
+        ]
+
+        # Keep the bot running
+        while True:
+            await asyncio.sleep(3600)  # Sleep for 1 hour
+
+    except Exception as e:
+        logger.error(f"Fatal error: {e}", exc_info=True)
+    finally:
+        # Cleanup
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await app.stop()
+        await bot.stop_health_server()
+        print("Bot shutdown complete")
+
+def register_handlers(app: Client):
+    """Register all message and callback handlers"""
     # Command handlers
     @app.on_message(filters.command("start") & (filters.private | (filters.group & filters.chat(Config.GROUP_ID) if Config.GROUP_ID else filters.group)))
     async def start_command(client: Client, message: Message):
-
-        await bot.start(client, message)
+        # 🔹 Check Force Sub first
+        # Force sub check for all private messages
+        if not await check_force_sub(client, message.from_user.id, message):
+            return
         
+        # ✅ Continue normal start flow
+        await bot.start(client, message)
+    @ app.on_message(filters.command("testforcesub") & filters.user(Config.ADMINS))
+    async def test_force_sub(client: Client, message: Message):
+        user_id = message.from_user.id
+        if len(message.command) > 1:
+            test_user_id = int(message.command[1])
+            user_id = test_user_id
+        
+        is_member = await bot.force_sub.check_member(client, user_id)
+        status = "✅ Subscribed" if is_member else "❌ Not subscribed"
+        
+        await message.reply_text(
+            f"Force Sub Test for user {user_id}:\n"
+            f"Status: {status}\n"
+            f"Enabled: {bot.force_sub.force_sub_enabled}\n"
+            f"Channels: {len(bot.force_sub.force_sub_channels)}"
+        )
+            
     @app.on_message(filters.command("broadcast") & filters.user(Config.ADMINS))
     async def broadcast_handler(client: Client, message: Message):
         await bot.broadcast.broadcast_message(client, message)
@@ -6755,8 +6938,56 @@ async def main():
             ])
         )
         # React to the user's message with a random emoji
-    
-      
+    @ app.on_message(filters.command("forcesub") & filters.user(Config.ADMINS))
+    async def force_sub_command(client: Client, message: Message):
+        if len(message.command) > 1:
+            subcommand = message.command[1].lower()
+            
+            if subcommand == "on":
+                await bot.force_sub.toggle_force_sub(True)
+                await message.reply_text("✅ Force subscription enabled")
+                
+            elif subcommand == "off":
+                await bot.force_sub.toggle_force_sub(False)
+                await message.reply_text("✅ Force subscription disabled")
+                
+            elif subcommand == "add" and len(message.command) > 2:
+                channel_id = message.command[2]
+                try:
+                    chat = await client.get_chat(channel_id)
+                    added = await bot.force_sub.add_channel(chat.id)
+                    if added:
+                        await message.reply_text(f"✅ Added channel: {chat.title}")
+                    else:
+                        await message.reply_text("ℹ️ Channel already in list")
+                except Exception as e:
+                    await message.reply_text(f"❌ Error: {e}")
+                    
+            elif subcommand == "remove" and len(message.command) > 2:
+                try:
+                    channel_id = int(message.command[2])
+                    removed = await bot.force_sub.remove_channel(channel_id)
+                    if removed:
+                        await message.reply_text("✅ Channel removed")
+                    else:
+                        await message.reply_text("❌ Channel not found")
+                except:
+                    await message.reply_text("❌ Invalid channel ID")
+                    
+            elif subcommand == "list":
+                await bot.force_sub.show_settings(client, message)
+                
+        else:
+            await message.reply_text(
+                "Usage: /forcesub <command>\n\n"
+                "Commands:\n"
+                "• on - Enable force sub\n"
+                "• off - Disable force sub\n"
+                "• add <channel> - Add channel\n"
+                "• remove <id> - Remove channel\n"
+                "• list - Show settings"
+            )
+        
     @app.on_message(filters.command("linksequel") & filters.private & filters.user(Config.ADMINS))
     async def link_sequel_command(client: Client, message: Message):
         if len(message.command) < 3:
@@ -6903,14 +7134,21 @@ async def main():
             elif state == "adding_db_channel":
                 await bot.process_db_channel_add(client, message)
                 return
-
+            elif state == "adding_force_sub_channel":
+                await bot.force_sub.process_add_channel(client, message)
+                return
+                
+            elif state == "removing_force_sub_channel":
+                await bot.force_sub.process_remove_channel(client, message)
+                return
+        
             # Handle session awaiting search
          # Check if user is awaiting search input
+      
             if user_id in bot.user_sessions and bot.user_sessions[user_id].get('awaiting_search'):
                 del bot.user_sessions[user_id]['awaiting_search']
                 await bot.process_search(client, message)
                 return
-                
 
         # Fallback: Handle regular private messages
         if Config.PM_SEARCH:
@@ -6987,11 +7225,28 @@ async def main():
             print(f"Inline query error: {e}")
             logger.error(f"Error handling inline query: {e}")
 
-    logger.info("Starting AnimeFilterBot...")
-    await app.start()
-    await idle()
-    
-    await app.stop()
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler('bot.log')
+        ]
+    )
+    
+    # Start the bot with auto-restart
+    while True:
+        try:
+            asyncio.run(main())
+        except KeyboardInterrupt:
+            asyncio.run(self.notification_manager.stop())
+
+            break
+        except Exception as e:
+            logger.error(f"Bot crashed: {e}", exc_info=True)
+            logger.info("Restarting in 10 seconds...")
+            time.sleep(10)
