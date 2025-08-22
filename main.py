@@ -1588,84 +1588,78 @@ class AnimeBot:
         # Remove multiple spaces
         filename = ' '.join(filename.split())
         return filename.strip()
-
-    def is_movie_file(self, filename: str, caption: str = "") -> bool:
-        """Check if file is a movie based on filename patterns"""
-        combined_text = f"{filename} {caption}".lower()
-        
-        movie_patterns = [
-            r'\bmovie\b',
-            r'\bfilm\b', 
-            r'complete movie',
-            r'full movie',
-            r'劇場版',
-            r'movie edition',
-            r'feature film',
-            r'\[movie\]',
-            r'\(movie\)',
-            r'-\s*movie\s*-'
-        ]
-        
-        return any(re.search(pattern, combined_text, re.IGNORECASE) for pattern in movie_patterns)
     async def extract_episode_number(self, message: Message, anime_type: str) -> Optional[int]:
-        # Get filename and caption
         file_name = message.document.file_name if message.document else message.video.file_name if message.video else ""
         caption = message.caption or ""
-        combined_text = f"{file_name} {caption}"
+        combined_text = f"{file_name} {caption}".lower()
     
-        # Normalize: remove brackets, underscores, dashes → spaces
-        combined_text = re.sub(r'[\[\](){}]', ' ', combined_text)
-        combined_text = re.sub(r'[_\-]', ' ', combined_text)
-        combined_text = re.sub(r'\s+', ' ', combined_text).strip().lower()
+        # Movie detection first
+        movie_patterns = [
+            r'\bmovie\b',
+            r'\[movie\]',
+            r'\(\s*movie\s*\)',
+            r'complete\s*movie',
+            r'full\s*movie',
+            r'劇場版',           # Japanese "Movie Edition"
+            r'feature\s*film'
+        ]
+        for pattern in movie_patterns:
+            if re.search(pattern, combined_text, re.IGNORECASE):
+                return 1  # Always episode 1 for movies
     
-        # 🔹 Step 1: Movie detection (always return 1 for movies)
-        if self.is_movie_file(file_name, caption):
-            return 1
-    
-        # 🔹 Step 2: Check anime type info
+        # Get type info
         type_info = Config.ANIME_TYPES.get(anime_type.upper(), {})
         if not type_info.get('has_episodes', True):
-            return 1  # Non-episodic content
+            return 1  # Non-episodic → treat as episode 1
     
-        # 🔹 Step 3: Episode regex patterns (priority order matters)
+        # Unified episode patterns
         patterns = [
-            # Season + Episode patterns
-            r'\bS(\d+)\s*E(\d+)\b',          # S01 E17
-            r'S\d+E(\d+)',                   # S01E13
-            r'\[S\d+\s*[-~]\s*E(\d+)\]',     # [S01-E13]
-            r'\bS\d+\s*[-~]\s*E(\d+)\b',     # S01 - E13
+            # Season + Episode
+            r'\[S(\d+)\s+E(\d+)\]',            
+            r'\[S\d+\s*[-~]\s*E(\d+)\]',       
+            r'\bS(\d+)\s*E(\d+)\b',            
+            r'\bS\d+\s*[-~]\s*E(\d+)\b',       
+            r'S\d+E(\d+)',                     
+            r'\[S(\d+)\s+EP?(\d+)\]',          
+            r'\bS(\d+)\s+EP?(\d+)\b',     
+            r'S(\d+)[\s._-]*EP?(\d+)',   # S01_EP11 or S01-EP11 or S01E11 or S01 EP11
+            r'\[Season\s*(\d+)\s*Episode\s*(\d+)\]',  
     
-            # Episode-only patterns
-            r'\[E(\d+)\]',                   # [E13]
-            r'OVA\s*[-~]?\s*(\d{1,3})',      # OVA - 05
-            r'\bEpisode\s*(\d+)\b',          # Episode 13
-            r'\bEp\s*(\d+)\b',               # Ep 13
-            r'-\s*(\d{2,3})\s*-',            # - 13 -
-            r'_\s*(\d{2,3})\s*_',            # _13_
-            r'\[\s*(\d+)\s*\]',              # [13]
-            r'\(\s*(\d+)\s*\)',              # (13)
-            r'\b(\d{2,3})\b',                # Standalone 13
-            r'第(\d+)話',                    # Japanese: 第13話
-            r'第(\d+)集'                     # Chinese: 第13集
+            # Episode only
+            r'\[E(\d+)\]',                     
+            r'\[EP?(\d+)\]',                   
+            r'\bEP?(\d+)\b',              
+            
+            r'\[Episode\s*(\d+)\]',            
+            r'OVA\s*[-~]?\s*(\d{1,3})',        
+            r'Episode\s*(\d+)',                
+            r'Ep\s*(\d+)',                     
+            r'-\s*(\d{2,3})\s*-',              
+            r'_\s*(\d{2,3})\s*_',              
+            r'\[\s*(\d+)\s*\]',                
+            r'\(\s*(\d+)\s*\)',                
+            r'\b(\d{2,3})\b',                  
+            r'\[(\d+)\s*of\s*\d+\]',           
+            r'第(\d+)話',                      
+            r'第(\d+)集'                       
         ]
     
-        # 🔹 Step 4: Search for matches
         for pattern in patterns:
             match = re.search(pattern, combined_text, re.IGNORECASE)
             if match:
                 try:
                     if len(match.groups()) > 1:
-                        return int(match.group(2))  # Season + Episode case
-                    else:
-                        return int(match.group(1))
+                        return int(match.group(2))  # Handle season+episode
+                    return int(match.group(1))
                 except (ValueError, IndexError):
                     continue
     
-        # 🔹 Step 5: If only season marker is found → assume Ep 1
+        # Season marker only (fallback)
         if re.search(r'S\d+', combined_text, re.IGNORECASE):
             return 1
     
-        return None  # Nothing matched
+        return None
+
 
     async def send_formatted_message(client, chat_id, text, reply_markup=None):
         try:
@@ -4526,16 +4520,16 @@ class AnimeBot:
             # Get forwarding info
             forward_from = message.forward_from_chat.id if message.forward_from_chat else \
                         message.forward_from.id if message.forward_from else None
-
+    
             db_channels = await self.db.get_database_channels()
             if forward_from not in db_channels:
                 await message.reply_text("⚠️ Files must be forwarded from an approved database channel!")
                 return
-
+    
             user_session = self.user_sessions[user_id]['add_episodes']
             anime_id = user_session['anime_id']
             anime_title = user_session['anime_title']
-
+    
             # Default to "TV" type if not specified
             anime_type = user_session.get('anime_type', 'TV').upper()
             if anime_type not in Config.ANIME_TYPES:
@@ -4545,7 +4539,7 @@ class AnimeBot:
                 )
                 return
             is_adult = anime_type in Config.ADULT_CONTENT_TYPES
-
+    
             file_name = ""
             file_type = ""
             if message.document:
@@ -4561,47 +4555,29 @@ class AnimeBot:
                     parse_mode=enums.ParseMode.MARKDOWN
                 )
                 return
-
+    
             caption = message.caption or ""
-            episode = None
-            for pattern in self.episode_patterns:
-                match = re.search(pattern, file_name, re.IGNORECASE)
-                if match:
-                    try:
-                        episode = int(match.group(1))
-                        break
-                    except (IndexError, ValueError):
-                        continue
-
-            if episode is None:
-                for pattern in self.episode_patterns:
-                    match = re.search(pattern, caption, re.IGNORECASE)
-                    if match:
-                        try:
-                            episode = int(match.group(1))
-                            break
-                        except (IndexError, ValueError):
-                            continue
-
+            
+            # Use the dedicated extract_episode_number method
+            episode = await self.extract_episode_number(message, anime_type)
+    
             if episode is None:
                 await message.reply_text(
                     "⚠️ *Could not parse episode number!*\n"
                     f"Filename: `{file_name}`\n"
-                    f"Caption: `{caption}`\n\n"
-                    "Please manually specify episode number by replying with:\n"
-                    "`/episode <number>`",
+                    f"Caption: `{caption}`\n\n",
                     parse_mode=enums.ParseMode.MARKDOWN
                 )
                 self.user_sessions[user_id]['awaiting_episode'] = True
                 return
-
+    
             quality = "unknown"
             for pattern in self.quality_patterns:
                 match = re.search(pattern, file_name, re.IGNORECASE)
                 if match:
                     quality = match.group(1).lower()
                     break
-
+    
             season = None
             for pattern in self.season_patterns:
                 match = re.search(pattern, file_name, re.IGNORECASE)
@@ -4611,14 +4587,14 @@ class AnimeBot:
                         break
                     except (IndexError, ValueError):
                         continue
-
+    
             language = None
             for pattern in self.language_patterns:
                 match = re.search(pattern, file_name, re.IGNORECASE)
                 if match:
                     language = match.group(1).upper()
                     break
-
+    
             file_size = ""
             if message.document:
                 size_bytes = message.document.file_size
@@ -4626,7 +4602,7 @@ class AnimeBot:
             elif message.video:
                 size_bytes = message.video.file_size
                 file_size = f"{size_bytes / (1024 * 1024):.2f}MB"
-
+    
             file_data = {
                 "_id": ObjectId(),
                 "anime_id": anime_id,
@@ -4645,7 +4621,7 @@ class AnimeBot:
                 "added_by": user_id,
                 "added_date": datetime.now()
             }
-
+    
             # Check for duplicates
             duplicate = False
             for db_client in self.db.anime_clients:
@@ -4663,7 +4639,7 @@ class AnimeBot:
                         break
                 except Exception as e:
                     logger.warning(f"Error checking duplicates in cluster: {e}")
-
+    
             if duplicate:
                 await message.reply_text(
                     f"⚠️ *File already exists for*:\n"
@@ -4675,14 +4651,14 @@ class AnimeBot:
                     parse_mode=enums.ParseMode.MARKDOWN
                 )
                 return
-
+    
             success = await self.db.insert_file(file_data)
             if not success:
                 raise Exception("Failed to insert file into database")
-
+    
             logger.info(f"Inserted file data: {file_data}")
             await self.update_stats("total_files")
-
+    
             await message.reply_text(
                 f"✅ *Added file for*:\n"
                 f"Anime: {anime_title}\n"
@@ -4709,12 +4685,10 @@ class AnimeBot:
                     file_data["episode"], 
                     user_id
                 )
-
+    
         except Exception as e:
             logger.error(f"File processing error: {e}")
             await message.reply_text("⚠️ Error processing file. Please try again.")
-
-
     async def handle_media(self, client: Client, message: Message):
         user_id = message.from_user.id
         if user_id not in Config.ADMINS:
