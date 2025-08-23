@@ -4,7 +4,7 @@ from typing import List
 from pyrogram import Client
 from pyrogram.errors import UserNotParticipant
 from pyrogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup
-from main import config 
+from violet import config 
 class ForceSub:
     def __init__(self, db, bot_instance):  # Add bot_instance parameter
         self.db = db
