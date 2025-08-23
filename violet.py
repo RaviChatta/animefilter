@@ -2423,28 +2423,14 @@ class AnimeBot:
             # ✅ Episode display
             # In your show_anime_details method:
          # ✅ Episode display formatting
-            ep_text = ""
           # ✅ Episode display
-            total_uploaded = await self.db.count_episodes(anime_id, count_unique=True)
-            max_episode = await self.get_max_episode(anime_id)
-            ani_total = anime.get('episodes')
-            status = anime.get('status', '').strip().upper()
+            ep_text = ""
+            if type_info.get('has_episodes'):
+                total_uploaded = await self.db.count_episodes(anime_id, count_unique=True)
 
-            # Handle different anime types and statuses
-            if anime_id == 6284053604036871611:  # One Piece special case
-                ep_text = f"{total_uploaded}+ episodes (Ongoing)"
-            elif not type_info.get('has_episodes'):  # Movies, OVAs, etc.
-                ep_text = "1 episode" if total_uploaded > 0 else "No episodes"
-            elif status == 'RELEASING':  # Ongoing series
-                if ani_total:
-                    ep_text = f"{total_uploaded}/{ani_total} (Ongoing)"
-                else:
-                    ep_text = f"{total_uploaded} episodes (Ongoing)"
-            else:  # Completed series
-                if ani_total and total_uploaded >= ani_total:
-                    ep_text = f"{total_uploaded}/{ani_total} (Complete)"
-                else:
-                    ep_text = f"{total_uploaded}/{ani_total or '?'}"
+                # ✅ Only add (uploaded/total) if status is RELEASING
+                if anime.get('status', '').strip().upper() == 'RELEASING':
+                    ep_text = f" ({total_uploaded}/{anime.get('episodes', '?')})"
 
             # Watch callback
             if type_info.get('has_episodes'):
@@ -4283,68 +4269,86 @@ class AnimeBot:
                 )
             else:
                 await callback_query.answer("Admin not found!", show_alert=True)
+    EPISODES_PER_PAGE = 100  # you can tune this to 50/100 safely
 
     # In AnimeBot class
-    async def admin_delete_episode_menu(self, client: Client, callback_query: CallbackQuery, anime_id: int):
-        """Show menu for deleting episodes"""
+    async def admin_delete_episode_menu(self, client: Client, callback_query: CallbackQuery, anime_id: int, page: int = 1):
+        """Show paginated menu for deleting episodes"""
         try:
             if callback_query.from_user.id not in Config.ADMINS:
                 await callback_query.answer("❌ Admin only", show_alert=True)
                 return
-            
+    
             anime = await self.db.find_anime(anime_id)
             if not anime:
                 await callback_query.answer("Anime not found", show_alert=True)
                 return
-            
-            # Get all episodes for this anime
+    
+            # Collect all episodes across clients
             all_episodes = set()
-            for client in self.db.anime_clients:
+            for db_client in self.db.anime_clients:
                 try:
-                    db = client[self.db.db_name]
+                    db = db_client[self.db.db_name]
                     episodes = await db.files.distinct("episode", {"anime_id": anime_id})
                     all_episodes.update(episodes)
                 except Exception:
                     continue
-            
+    
             if not all_episodes:
                 await callback_query.answer("No episodes found", show_alert=True)
                 return
-            
+    
             sorted_eps = sorted(all_episodes)
+            total_eps = len(sorted_eps)
+    
+            # Pagination logic
+            total_pages = (total_eps + EPISODES_PER_PAGE - 1) // EPISODES_PER_PAGE
+            page = max(1, min(page, total_pages))
+            start = (page - 1) * EPISODES_PER_PAGE
+            end = start + EPISODES_PER_PAGE
+            current_eps = sorted_eps[start:end]
+    
             keyboard = []
             row = []
-            
-            # Create buttons for each episode
-            for ep in sorted_eps:
+            for ep in current_eps:
                 row.append(InlineKeyboardButton(f"Ep {ep}", callback_data=f"del_ep_{anime_id}_{ep}"))
                 if len(row) == 5:
                     keyboard.append(row)
                     row = []
             if row:
                 keyboard.append(row)
-            
-            # Add bulk delete options
+    
+            # Bulk delete + pagination
             keyboard.append([
-                InlineKeyboardButton("🗑 Delete ALL Episodes", callback_data=f"del_all_{anime_id}"),
+                InlineKeyboardButton("🗑 Delete ALL", callback_data=f"del_all_{anime_id}"),
                 InlineKeyboardButton("🔍 Select Range", callback_data=f"del_range_{anime_id}")
             ])
-            
+    
+            nav_buttons = []
+            if page > 1:
+                nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"del_menu_{anime_id}_{page-1}"))
+            nav_buttons.append(InlineKeyboardButton(f"📄 {page}/{total_pages}", callback_data="noop"))
+            if page < total_pages:
+                nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"del_menu_{anime_id}_{page+1}"))
+    
+            keyboard.append(nav_buttons)
+    
             keyboard.append([
                 InlineKeyboardButton("🔙 Back", callback_data=f"anime_{anime_id}"),
                 InlineKeyboardButton("❌ Close", callback_data="close_message")
             ])
-            
+    
             await callback_query.message.edit_text(
                 f"🗑 <b>Delete Episodes for:</b>\n{anime['title']}\n\n"
+                f"Page {page}/{total_pages} • Total Episodes: {total_eps}\n"
                 "Select episode to delete:",
                 reply_markup=InlineKeyboardMarkup(keyboard),
                 parse_mode=enums.ParseMode.HTML
             )
+    
         except Exception as e:
             logger.error(f"Error in delete episode menu: {e}")
             await callback_query.answer("Error loading menu", show_alert=True)
-
     async def confirm_delete_episode(self, client: Client, callback_query: CallbackQuery, anime_id: int, episode: int):
         """Show confirmation before deleting episode"""
         try:
@@ -7227,8 +7231,9 @@ class AnimeBot:
             # In your callback query handler
             # In your callback query handler
             elif data.startswith("del_menu_"):
-                anime_id = int(data.split("_")[2])
-                await self.admin_delete_episode_menu(client, callback_query, anime_id)
+                _, anime_id, page = data.split("_")
+                await self.admin_delete_episode_menu(client, callback_query, int(anime_id), int(page))
+
             elif data.startswith("del_ep_"):
                 parts = data.split("_")
                 anime_id = int(parts[2])
