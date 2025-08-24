@@ -231,7 +231,7 @@ class Database:
                         "episode_range": "1086–Present",
                         "description": "The Straw Hats explore Egghead and face new challenges",
                         "arcs": [
-                            {"id": 37, "name": "Egghead", "episode_range": "1086–1140", "description": "Ongoing adventures on Egghead Island"}
+                            {"id": 37, "name": "Egghead", "episode_range": "1086–Present", "description": "Ongoing adventures on Egghead Island"}
                         ]
                     }
                 ]
@@ -1917,23 +1917,32 @@ class AnimeBot:
 
         # Episode patterns (your original order, enhanced for padded numbers)
         patterns = [
-            r'\[(\d{3,4})\s*-\s*[^\]]+\]',  # [0055 - One Piece]
-            r'\[\s*(\d{3,4})\s*\]',         # [0055]
-            r'\b(\d{3,4})\s*-\s*[^\[]',     # 0055 - One Piece
-            r'\[S\d+\s*[-~]\s*E(\d+)\]',    # [S01-E13]
-            r'\bS\d+\s*[-~]\s*E(\d+)\b',    # S01 - E13
-            r'\[E(\d+)\]',                   # [E13]
-            r'S\d+E(\d+)',                   # S01E13
-            r'OVA\s*[-~]?\s*(\d{1,3})',     # OVA - 05
-            r'Episode\s*(\d+)',              # Episode 13
-            r'Ep\s*(\d+)',                   # Ep 13
-            r'-\s*(\d{2,3})\s*-',            # - 13 -
-            r'_\s*(\d{2,3})\s*_',            # _13_
-            r'\(\s*(\d+)\s*\)',              # (13)
-            r'\b(\d{2,3})\b',                # Standalone 13
-            r'第(\d+)話',                     # Japanese
-            r'第(\d+)集'                      # Chinese
-        ]
+        r'\[(\d{3,4})\s*-\s*[^\]]+\]',   # [0055 - One Piece]
+        r'\[\s*(\d{3,4})\s*\]',          # [0055]
+        r'\b(\d{3,4})\s*-\s*[^\[]',      # 0055 - One Piece
+    
+        r'\[[^\]]*E(\d+)[^\]]*\]',       # [Onepiece - E1127], [Anime - Ep12 - Sub]
+        r'\bS\d+E(\d+)\b',               # S01E13
+    
+        r'[-_\( ]E(\d+)[-_ \)]',         # -E1127-, _E1127_, (E1127)
+        r'\bE(\d+)\b',                   # plain E1127
+        r'\bEP(\d+)\b',                  # EP1125 / Ep1125 / ep1125
+    
+        r'\[S\d+\s*[-~]\s*E(\d+)\]',     # [S01-E13]
+        r'\bS\d+\s*[-~]\s*E(\d+)\b',     # S01 - E13
+        r'\[E(\d+)\]',                   # [E13]
+    
+        r'OVA\s*[-~]?\s*(\d{1,3})',      # OVA - 05
+        r'Episode\s*(\d+)',              # Episode 13
+        r'Ep\s*(\d+)',                   # Ep 13
+        r'-\s*(\d{2,3})\s*-',            # - 13 -
+        r'_\s*(\d{2,3})\s*_',            # _13_
+        r'\(\s*(\d+)\s*\)',              # (13)
+        r'\b(\d{2,3})\b',                # Standalone 13
+        r'第(\d+)話',                     # Japanese
+        r'第(\d+)集'                      # Chinese
+    ]
+
 
         for pattern in patterns:
             matches = re.finditer(pattern, combined_text, re.IGNORECASE)
@@ -7231,8 +7240,9 @@ class AnimeBot:
             # In your callback query handler
             # In your callback query handler
             elif data.startswith("del_menu_"):
-                _, anime_id, page = data.split("_")
+                _, _, anime_id, page = data.split("_")   # correct unpacking
                 await self.admin_delete_episode_menu(client, callback_query, int(anime_id), int(page))
+    
 
             elif data.startswith("del_ep_"):
                 parts = data.split("_")
