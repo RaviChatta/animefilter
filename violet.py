@@ -7240,9 +7240,17 @@ class AnimeBot:
             # In your callback query handler
             # In your callback query handler
             elif data.startswith("del_menu_"):
-                _, _, anime_id, page = data.split("_")   # correct unpacking
+                parts = data.split("_")
+                if len(parts) == 4:
+                    _, _, anime_id, page = parts
+                elif len(parts) == 3:
+                    _, _, anime_id = parts
+                    page = 1  # default to page 1 if not provided
+                else:
+                    return await callback_query.answer("Invalid callback data", show_alert=True)
+            
                 await self.admin_delete_episode_menu(client, callback_query, int(anime_id), int(page))
-    
+
 
             elif data.startswith("del_ep_"):
                 parts = data.split("_")
