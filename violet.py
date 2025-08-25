@@ -1123,7 +1123,8 @@ class Config:
     DELETE_TIMER_MINUTES = int(os.getenv("DELETE_TIMER_MINUTES", 1))
     BOT_NAME = os.getenv("BOT_NAME", "Anime Downloader Bot")
     MAX_EPISODES_PER_PAGE = 30
-    MAX_SEARCH_RESULTS = 10
+    EPISODES_PER_PAGE = 100  # you can tune this to 50/100 safely delete episodes 
+    MAX_SEARCH_RESULTS = 30
     DEVELOPER_USERNAME = "https://t.me/sun_godnika_bot"
     MAX_BATCH_FILES = 100
     PM_SEARCH = os.getenv("PM_SEARCH", "True") == "True"
@@ -1131,7 +1132,7 @@ class Config:
     START_PIC = os.getenv("START_PIC", "https://i.ibb.co/pB8SMVfz/x.png")
     COVER_PIC = os.getenv("COVER_PIC", "https://files.catbox.moe/roj8a1.jpg")
     ANILIST_API = "https://graphql.anilist.co"
-    RATE_LIMIT = 10  # Messages per second
+    RATE_LIMIT = 8  # Messages per second
     REQUEST_TIMEOUT = 10  # Seconds
     MAX_WATCHLIST_ITEMS = 100
     PREMIUM_MODE = os.getenv("PREMIUM_MODE", "False") == "True"
@@ -4278,7 +4279,6 @@ class AnimeBot:
                 )
             else:
                 await callback_query.answer("Admin not found!", show_alert=True)
-    EPISODES_PER_PAGE = 100  # you can tune this to 50/100 safely
 
     # In AnimeBot class
     async def admin_delete_episode_menu(self, client: Client, callback_query: CallbackQuery, anime_id: int, page: int = 1):
@@ -4311,10 +4311,10 @@ class AnimeBot:
             total_eps = len(sorted_eps)
     
             # Pagination
-            total_pages = (total_eps + EPISODES_PER_PAGE - 1) // EPISODES_PER_PAGE
+            total_pages = (total_eps + Config.EPISODES_PER_PAGE - 1) // Config.EPISODES_PER_PAGE
             page = max(1, min(page, total_pages))
-            start = (page - 1) * EPISODES_PER_PAGE
-            end = start + EPISODES_PER_PAGE
+            start = (page - 1) * Config.EPISODES_PER_PAGE
+            end = start + Config.EPISODES_PER_PAGE
             current_eps = sorted_eps[start:end]
     
             keyboard = []
