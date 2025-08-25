@@ -2512,7 +2512,7 @@ class AnimeBot:
             # Add Delete Episodes and Add Episodes buttons for admins
             if user_id in Config.ADMINS:
                 buttons.append([
-                    InlineKeyboardButton("🗑️ Delete Episodes", callback_data=f"del_menu_{anime_id}")
+                    InlineKeyboardButton("🗑️ Delete Episodes", callback_data=f"del_menu_{anime_id}_1")
                 ])
                 buttons.append([
                     InlineKeyboardButton("📁 Add Episodes", callback_data=f"admin_add_episodes_{anime_id}")
@@ -4293,7 +4293,7 @@ class AnimeBot:
                 await callback_query.answer("Anime not found", show_alert=True)
                 return
     
-            # Collect all episodes across clients
+            # Collect all episodes
             all_episodes = set()
             for db_client in self.db.anime_clients:
                 try:
@@ -4310,7 +4310,7 @@ class AnimeBot:
             sorted_eps = sorted(all_episodes)
             total_eps = len(sorted_eps)
     
-            # Pagination logic
+            # Pagination
             total_pages = (total_eps + EPISODES_PER_PAGE - 1) // EPISODES_PER_PAGE
             page = max(1, min(page, total_pages))
             start = (page - 1) * EPISODES_PER_PAGE
@@ -4327,12 +4327,13 @@ class AnimeBot:
             if row:
                 keyboard.append(row)
     
-            # Bulk delete + pagination
+            # Bulk delete
             keyboard.append([
                 InlineKeyboardButton("🗑 Delete ALL", callback_data=f"del_all_{anime_id}"),
                 InlineKeyboardButton("🔍 Select Range", callback_data=f"del_range_{anime_id}")
             ])
     
+            # Navigation buttons
             nav_buttons = []
             if page > 1:
                 nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"del_menu_{anime_id}_{page-1}"))
@@ -4342,6 +4343,7 @@ class AnimeBot:
     
             keyboard.append(nav_buttons)
     
+            # Back/Close
             keyboard.append([
                 InlineKeyboardButton("🔙 Back", callback_data=f"anime_{anime_id}"),
                 InlineKeyboardButton("❌ Close", callback_data="close_message")
@@ -7240,16 +7242,9 @@ class AnimeBot:
             # In your callback query handler
             # In your callback query handler
             elif data.startswith("del_menu_"):
-                parts = data.split("_")
-                if len(parts) == 4:
-                    _, _, anime_id, page = parts
-                elif len(parts) == 3:
-                    _, _, anime_id = parts
-                    page = 1  # default to page 1 if not provided
-                else:
-                    return await callback_query.answer("Invalid callback data", show_alert=True)
-            
+                _, _, anime_id, page = data.split("_")  # always 4 parts now
                 await self.admin_delete_episode_menu(client, callback_query, int(anime_id), int(page))
+
 
 
             elif data.startswith("del_ep_"):
