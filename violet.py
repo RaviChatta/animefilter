@@ -1123,7 +1123,7 @@ class Config:
     DELETE_TIMER_MINUTES = int(os.getenv("DELETE_TIMER_MINUTES", 1))
     BOT_NAME = os.getenv("BOT_NAME", "Anime Downloader Bot")
     MAX_EPISODES_PER_PAGE = 30
-    EPISODES_PER_PAGE = 100  # you can tune this to 50/100 safely delete episodes 
+    EPISODES_PER_PAGE = 50  # you can tune this to 50/100 safely delete episodes 
     MAX_SEARCH_RESULTS = 30
     DEVELOPER_USERNAME = "https://t.me/sun_godnika_bot"
     MAX_BATCH_FILES = 100
