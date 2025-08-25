@@ -4324,30 +4324,30 @@ class AnimeBot:
                 if len(row) == 5:
                     keyboard.append(row)
                     row = []
-            if row:
+            if row:  # append last row if not empty
                 keyboard.append(row)
     
-            # Bulk delete
+            # 🔥 Always show Bulk Delete options
             keyboard.append([
                 InlineKeyboardButton("🗑 Delete ALL", callback_data=f"del_all_{anime_id}"),
                 InlineKeyboardButton("🔍 Select Range", callback_data=f"del_range_{anime_id}")
             ])
     
-            # Navigation buttons
+            # 🔥 Always show page indicator (even for 1 page)
             nav_buttons = []
             if page > 1:
                 nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"del_menu_{anime_id}_{page-1}"))
             nav_buttons.append(InlineKeyboardButton(f"📄 {page}/{total_pages}", callback_data="noop"))
             if page < total_pages:
                 nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"del_menu_{anime_id}_{page+1}"))
-    
             keyboard.append(nav_buttons)
     
-            # Back/Close
+            # 🔙 Back / Close row
             keyboard.append([
                 InlineKeyboardButton("🔙 Back", callback_data=f"anime_{anime_id}"),
                 InlineKeyboardButton("❌ Close", callback_data="close_message")
             ])
+
     
             await callback_query.message.edit_text(
                 f"🗑 <b>Delete Episodes for:</b>\n{anime['title']}\n\n"
@@ -4368,7 +4368,7 @@ class AnimeBot:
                 await callback_query.answer("Anime not found", show_alert=True)
                 return
             
-            # Get files for this episode to show count
+            # Get files for this episode
             files = await self.db.find_files(anime_id, episode)
             file_count = len(files) if files else 0
             
@@ -4381,7 +4381,7 @@ class AnimeBot:
                 reply_markup=InlineKeyboardMarkup([
                     [
                         InlineKeyboardButton("✅ Confirm Delete", callback_data=f"confirm_del_{anime_id}_{episode}"),
-                        InlineKeyboardButton("❌ Cancel", callback_data=f"del_menu_{anime_id}")
+                        InlineKeyboardButton("❌ Cancel", callback_data=f"del_menu_{anime_id}_1")  # 🔧 fixed
                     ]
                 ]),
                 parse_mode=enums.ParseMode.HTML
@@ -4443,33 +4443,41 @@ class AnimeBot:
             logger.error(f"Error in delete all confirmation: {e}")
             await callback_query.answer("Error preparing deletion", show_alert=True)
 
-    async def confirm_delete_all_episodes(self, client: Client, callback_query: CallbackQuery, anime_id: int):
-        """Actually delete all episodes"""
+    async def delete_all_episodes(self, client: Client, callback_query: CallbackQuery, anime_id: int):
+        """Delete all episodes for an anime"""
         try:
-            deleted = await self.db.delete_episode(anime_id)
+            anime = await self.db.find_anime(anime_id)
+            if not anime:
+                await callback_query.answer("Anime not found", show_alert=True)
+                return
             
-            await callback_query.message.edit_text(
-                f"✅ Successfully deleted {deleted} files for all episodes",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔙 Back to Anime", callback_data=f"anime_{anime_id}")]
-                ])
-            )
-            
-            # Also update anime episode count to 0
-            for client in self.db.anime_clients:
+            # Count total files
+            total_files = 0
+            for db_client in self.db.anime_clients:
                 try:
-                    db = client[self.db.db_name]
-                    await db.anime.update_one(
-                        {"id": anime_id},
-                        {"$set": {"episodes": 0}}
-                    )
+                    db = db_client[self.db.db_name]
+                    count = await db.files.count_documents({"anime_id": anime_id})
+                    total_files += count
                 except Exception:
                     continue
             
-            logger.info(f"Admin {callback_query.from_user.id} deleted ALL episodes from anime {anime_id}")
+            await callback_query.message.edit_text(
+                f"⚠️ <b>Confirm Delete ALL Episodes</b>\n\n"
+                f"Anime: <b>{anime['title']}</b>\n"
+                f"Total files to delete: <b>{total_files}</b>\n\n"
+                "This will remove ALL episodes and cannot be undone!",
+                reply_markup=InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton("✅ Confirm Delete ALL", callback_data=f"confirm_del_all_{anime_id}"),
+                        InlineKeyboardButton("❌ Cancel", callback_data=f"del_menu_{anime_id}_1")  # 🔧 fixed
+                    ]
+                ]),
+                parse_mode=enums.ParseMode.HTML
+            )
         except Exception as e:
-            logger.error(f"Error deleting all episodes: {e}")
-            await callback_query.answer("Error deleting episodes", show_alert=True)
+            logger.error(f"Error in delete all confirmation: {e}")
+            await callback_query.answer("Error preparing deletion", show_alert=True)
+
     async def add_owner_start(self, client: Client, callback_query: CallbackQuery):
         """Start process to add an owner"""
         if callback_query.from_user.id not in self.config.OWNERS:
