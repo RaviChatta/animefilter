@@ -21,7 +21,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from aiohttp import ClientSession, ClientTimeout
 from pyrogram.enums import ParseMode
 from aiohttp import web
-from pyrogram import Client, filters, enums
+from pyrogram import Client, filters, enums ,  __version__
 from pyrogram.types import (
     InlineKeyboardButton, 
     InlineKeyboardMarkup, 
@@ -36,6 +36,8 @@ from premium import *
 from request import RequestSystem
 from pyrogram.handlers import MessageHandler  # Add this import
 from pyrogram.errors import FloodWait, UserIsBlocked, MessageNotModified, PeerIdInvalid
+from pyrogram.errors.exceptions.bad_request_400 import UserNotParticipant
+from pyrogram.errors import FloodWait, UserIsBlocked, InputUserDeactivated, UserNotParticipant, MediaEmpty
 from pyrogram import idle
 from pyrogram import enums
 from pyrogram.enums import ChatType , ParseMode
@@ -45,7 +47,6 @@ from settings import config
 from scripts import Scripts
 from anime_quotes import AnimeQuotes
 from force_sub import ForceSub
-
 
 
 MAX_FREE_TIER_SPACE = 500 * 1024 * 1024  # 500 MB cap for MongoDB Atlas free tier
@@ -64,7 +65,7 @@ logger = logging.getLogger(__name__)
 
 # Database Configuration
 class Database:
-    def __init__(self):
+    def __init__(self, bot_instance=None):  # Add bot_instance parameter
         self.anime_uris = [
             os.getenv("PRIMARY_MONGO_URI"),
             os.getenv("SECONDARY_MONGO_URI"),
@@ -77,7 +78,8 @@ class Database:
         ]
         self.users_uri = os.getenv("USERS_MONGO_URI")
         self.db_name = os.getenv("DB_NAME", "AnimeFilterBot")
-        
+        self.bot_instance = bot_instance  # Store bot instance
+
         self.anime_clients = []
         self.users_client = None
         self.users_db = None
@@ -246,6 +248,7 @@ class Database:
             
             # Initialize anime clusters
             await self._initialize_anime_clusters()
+            self.update_channel_logs = self.users_db.update_channel_logs
             self.cluster_order = list(range(len(self.anime_clients)))
             random.shuffle(self.cluster_order)
             self.current_insert_client = -1
@@ -270,7 +273,9 @@ class Database:
             # Create indexes
             await self._create_indexes()
             
-            
+            await self.update_channel_logs.create_index([("timestamp", -1)])
+            await self.update_channel_logs.create_index([("anime_id", 1)])
+        
             # Initialize statistics
            
             logger.info("Database initialization completed successfully")
@@ -458,6 +463,8 @@ class Database:
     async def insert_anime(self, anime_data):
         """Insert or update anime document using round-robin"""
         max_retries = 3
+        existing = None
+        success = False
 
         for attempt in range(max_retries):
             try:
@@ -482,15 +489,26 @@ class Database:
                             continue
                     return updated
 
+                # Insert new anime
                 await db.anime.insert_one(anime_data)
                 logger.info(f"Inserted anime into cluster {self.current_insert_client}")
-                return True
+                success = True
+                break  # success, exit retry loop
 
             except Exception as e:
                 logger.error(f"Insert attempt {attempt + 1} failed: {e}")
                 await asyncio.sleep(1)
 
-        return False
+        # Notify only if new insert (not update)
+        if success and not existing:
+            # FIXED: Call the bot_instance's method
+            if self.bot_instance:
+                asyncio.create_task(self.bot_instance.queue_new_anime(anime_data))
+            else:
+                logger.error("bot_instance not set - cannot notify new anime")
+
+        return success
+
     # In your Database class, fix the check_duplicate_file method:
     async def check_duplicate_file(self, file_data):
         """Check for duplicate files across all clusters"""
@@ -521,39 +539,50 @@ class Database:
                 logger.warning(f"Error checking duplicates in cluster {i}: {str(e)[:200]}")
         
         return False
-
     async def insert_file(self, file_data):
         """Insert file into anime's cluster or fallback via round-robin"""
+        # ✅ ADD THIS: Ensure required fields have default values FIRST
+        file_data.setdefault("quality", "Unknown")
+        file_data.setdefault("language", "Unknown")
+        file_data.setdefault("type", "TV")
+        file_data.setdefault("episodes", 1)
+        
+        success = False
+
         # First check for duplicates globally
         if await self.check_duplicate_file(file_data):
             logger.info("Duplicate file detected, skipping insertion")
-            # DEBUG: See what's causing the duplicate detection
             await self.debug_duplicate_check(file_data)
             return False
-    # FIX: Call categorize_episode correctly
-        file_data = await self.categorize_episode(file_data["anime_id"], file_data["episode"], file_data)
+
+        # Categorize episode
+        file_data = await self.categorize_episode(
+            file_data["anime_id"], file_data["episode"], file_data
+        )
+
+        # Try inserting into an existing anime cluster
         for i, client in enumerate(self.anime_clients):
             try:
-                if not hasattr(client, '__getitem__'):
-                    logger.error(f"Cluster {i} client is not subscriptable")
-                    continue
-
                 db = client[self.db_name]
-
-                # Check if anime exists in this cluster
                 anime_exists = await db.anime.count_documents({"id": file_data["anime_id"]}) > 0
-
                 if anime_exists:
                     await db.files.insert_one(file_data)
                     logger.info(f"Inserted file into existing anime cluster {i}")
-
-                    return True
+                    success = True
+                    break
             except Exception as e:
                 logger.warning(f"Cluster {i} operation failed: {str(e)[:200]}")
                 continue
 
-        # Anime not found in any cluster - insert new anime first
-        # Anime not found in any cluster - insert new anime first
+        if success:
+            # FIXED: Call the bot_instance's method, not Database's
+            if self.bot_instance:
+                asyncio.create_task(self.bot_instance.queue_new_episode(file_data))
+            else:
+                logger.error("bot_instance not set - cannot notify new episode")
+            return True
+
+        # Anime not found in any cluster — insert anime first
         anime_data = {
             "id": file_data["anime_id"],
             "title": file_data["anime_title"],
@@ -570,7 +599,6 @@ class Database:
             anime_data["is_ongoing"] = True
 
         if await self.insert_anime(anime_data):
-            # Retry file insertion after anime is inserted
             return await self.insert_file(file_data)
 
         return False
@@ -1102,6 +1130,55 @@ class Database:
                         
             except Exception as e:
                 logger.error(f"Debug error in cluster {i}: {e}")
+
+    async def log_new_anime(self, anime_data: dict):
+        """Log new anime addition"""
+        try:
+            # Check if collection exists, create if not
+            if not hasattr(self, 'update_channel_logs'):
+                self.update_channel_logs = self.users_db.update_channel_logs
+            
+            await self.update_channel_logs.insert_one({
+                "type": "new_anime",
+                "anime_id": anime_data["id"],
+                "title": anime_data["title"],
+                "timestamp": datetime.now(),
+                "data": anime_data
+            })
+        except Exception as e:
+            logger.error(f"Error logging new anime: {e}")
+
+    async def log_new_episode(self, file_data: dict):
+        """Log new episode addition"""
+        try:
+            # Check if collection exists, create if not
+            if not hasattr(self, 'update_channel_logs'):
+                self.update_channel_logs = self.users_db.update_channel_logs
+                
+            await self.update_channel_logs.insert_one({
+                "type": "new_episode",
+                "anime_id": file_data["anime_id"],
+                "episode": file_data["episode"],
+                "quality": file_data.get("quality", ""),
+                "timestamp": datetime.now(),
+                "data": file_data
+            })
+        except Exception as e:
+            logger.error(f"Error logging new episode: {e}")
+    async def get_watchlist_count(self, anime_id: int) -> int:
+        """Get number of users who have this anime in watchlist"""
+        return await self.watchlist_collection.count_documents({"anime_id": anime_id})
+
+    async def notify_new_anime(self, anime_data: dict):
+        """Notify about new anime addition - placeholder method"""
+        logger.info(f"New anime added: {anime_data.get('title', 'Unknown')}")
+        # This method will be implemented in the AnimeBot class
+        pass
+    async def notify_new_episode(self, file_data: dict):
+        """Notify about new episode addition - placeholder method"""
+        logger.info(f"New episode added: {file_data.get('anime_id')} EP{file_data.get('episode')}")
+        # This method will be implemented in the AnimeBot class
+        pass
 # Bot Configuration
 class Config:
     BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -1129,7 +1206,7 @@ class Config:
     MAX_BATCH_FILES = 100
     PM_SEARCH = os.getenv("PM_SEARCH", "True") == "True"
     PROTECT_CONTENT = os.getenv("PROTECT_CONTENT", "False") == "True"
-    START_PIC = os.getenv("START_PIC", "https://i.ibb.co/pB8SMVfz/x.png")
+   # START_PIC = os.getenv("START_PIC", "https://i.ibb.co/pB8SMVfz/x.png")
     COVER_PIC = os.getenv("COVER_PIC", "https://files.catbox.moe/roj8a1.jpg")
     ANILIST_API = "https://graphql.anilist.co"
     RATE_LIMIT = 8  # Messages per second
@@ -1162,6 +1239,88 @@ class Config:
         'HENTAI': {'name': 'Hentai', 'has_episodes': True, 'default_episodes': 1},
         'ANIME': {'name': 'Anime', 'has_episodes': True, 'default_episodes': 12}  # Added generic ANIME type
     }
+    START_PICS = [
+     #   "https://telegra.ph/file/4414fb4d9e5fc36b65dc3-226143890200f06482.jpg",
+     #   "https://telegra.ph/file/5e8d5c2ffbca4b9fa8c55-2b761e82504f6d8775.jpg",
+     #   "https://telegra.ph/file/66c4adb1cf48ad68f3e31-81b19189a88625a39d.jpg",
+     #   "https://telegra.ph/file/917c9567c4bb6da7c6db8-f7339d7b2e93398c8d.jpg",
+      #  "https://telegra.ph/file/e7d8001a5813aa0bf8cef-f1ea2f9acd19c8c33b.jpg",
+        "https://telegra.ph/file/415824c578ecf968a0c97-415f6bd1d2f2288c37.jpg",
+        "https://telegra.ph/file/145eb941c14244ba7d25d-8cc9e293f41a01e04a.jpg",
+        "https://telegra.ph/file/7388e3b2d3578ca9b596b-ae32749fd31e3f5bc0.jpg",
+        "https://telegra.ph/file/0b7be04643304a2ebcc6c-0587c187997cf914a7.jpg",
+        "https://telegra.ph/file/3f5e586ea5bbec365d779-0dedabf922fe53e191.jpg",
+      #  "https://telegra.ph/file/c94cffc02557fb0f11098-69ea5789dd37e12834.jpg",
+      #  "https://telegra.ph/file/5d79104e8468436552663-2bcd118f9816175500.jpg",
+      #  "https://telegra.ph/file/479b4d3467abf19b6b7a8-79e46663286d728dbc.jpg",
+      #  "https://telegra.ph/file/69e42d76add43f00c55ab-e7276303644245a02b.jpg",
+      #  "https://telegra.ph/file/5cd3f2dd31d0c104d738f-b5176fcaaf1d27c86b.jpg",
+      #  "https://telegra.ph/file/8aea25f56068077fb9a6e-7c3196d90da6c4c137.jpg",
+      #  "https://telegra.ph/file/e91f8620c6042c521b624-5c66a3ccffd8b58b35.jpg",
+      #  "https://telegra.ph/file/59e48aaffa4f757f9c91d-266c89b777ae2c1f9c.jpg",
+      #  "https://telegra.ph/file/0bed23372a01242cc4bd5-119156af63830625cf.jpg",
+      #  "https://telegra.ph/file/7baf42b4bf222dfa8397f-8539ff06db4ae8af3f.jpg",
+        "https://ik.imagekit.io/erenyeager2410/PICS/zoro-roronoa-on-the-going-merry-at-sunset-1225302016645927004.jpeg?updatedAt=1756492246054",
+        "https://ik.imagekit.io/erenyeager2410/PICS/brook-from-one-piece-illustration-1224915155926646804.jpeg?updatedAt=1756492248462",
+        "https://ik.imagekit.io/erenyeager2410/PICS/serenity-by-the-poolside-violet-evergarden-in-moonlight-1231463499180539965.jpeg?updatedAt=1756492246736",
+        "https://ik.imagekit.io/erenyeager2410/PICS/captain-shanks-overlooking-the-horizon-1234022190144290847.jpeg?updatedAt=1756492247212",
+        "https://ik.imagekit.io/erenyeager2410/PICS/luffy-against-the-storm-1234028168999075850.jpeg?updatedAt=1756492246959",
+        "https://ik.imagekit.io/erenyeager2410/PICS/luffy-in-distant-landscape-1234028984564453466%20(1).jpeg?updatedAt=1756492246192"
+    ]
+    
+    # Keep the original START_PIC for backward compatibility
+    START_PIC = START_PICS[0] if START_PICS else "https://i.ibb.co/pB8SMVfz/x.png"
+
+    UPDATE_CHANNEL_ID = int(os.getenv("UPDATE_CHANNEL_ID", -1001333766434))  # Default channel ID
+    UPDATE_CHANNEL_USERNAME = os.getenv("UPDATE_CHANNEL_USERNAME", "@aujasuasbj")
+    POST_NEW_ANIME = os.getenv("POST_NEW_ANIME", "True") == "True"
+    POST_NEW_EPISODES = os.getenv("POST_NEW_EPISODES", "True") == "True"
+    POST_ONGOING_UPDATES = os.getenv("POST_ONGOING_UPDATES", "True") == "True"
+    
+    # Message templates
+    NEW_ANIME_TEMPLATE = (
+        "🎉 <b>New Anime Added!</b>\n\n"
+        "🎬 <b>Title:</b> {title}\n"
+        "📺 <b>Type:</b> {type}\n"
+        "📊 <b>Episodes:</b> {episodes}\n"
+        "⭐ <b>Rating:</b> {rating}/10\n"
+        "🏷️ <b>Genres:</b> {genres}\n"
+        "📅 <b>Year:</b> {year}\n\n"
+        "🔗 <a href='{url}'>View on AniList</a>\n"
+        "🔍 Search: <code>{search_query}</code>"
+    )
+    
+    NEW_EPISODE_TEMPLATE = (
+        "📢 <b>New Episode Available!</b>\n\n"
+        "🎬 <b>Anime:</b> {anime_title}\n"
+        "📺 <b>Episode:</b> {episode} [{quality}]\n"  # ✅ ADDED BRACKETS FOR QUALITIES
+        "🗣️ <b>Language:</b> {language}\n\n"
+        "🔗 <a href='{url}'>View on AniList</a>\n"
+      #  "⬇️ Download: <code>/dl_{file_id}</code>"
+    )
+        
+    ONGOING_UPDATE_TEMPLATE = (
+        "🔄 <b>Ongoing Series Update</b>\n\n"
+        "🎬 <b>Anime:</b> {anime_title}\n"
+        "📺 <b>Latest Episode:</b> {episode}\n"
+        "📊 <b>Total Uploaded:</b> {uploaded}/{total}\n"
+        "🎯 <b>Latest Quality:</b> {quality}\n"  # ✅ ADDED QUALITY INFO
+        "🏷️ <b>Status:</b> {status}\n\n"
+        "👥 <b>Watchlist:</b> {watchlist_count} users\n"  # ✅ IMPROVED EMOJI
+        "🔗 <a href='{url}'>View on AniList</a>"
+    )
+
+    MESSAGE_EFFECT_IDS = [
+        # Latest working effect IDs (2024)
+        5104841245755180586,  # 🔥 Fire effect
+        5107584321108051014,  # 👍 Thumbs up effect
+      #  5044134455711629726,  # ❤️ Heart effect
+       # 5046509860389126642,  # 🎉 Celebration effect
+        5104858069142078462,  # 👎 Thumbs down effect
+        5046589136895476101,  # 💩 Poop effect
+        5107584321108051014
+        
+    ]
     @property
     def MULTI_EPISODE_TYPES(self):
         return [k for k, v in self.ANIME_TYPES.items() if v['has_episodes'] is True]
@@ -1177,14 +1336,27 @@ class Config:
     ADULT_CONTENT_TYPES = ['ADULT', 'HENTAI']
 
 async def encode(string: str) -> str:
-    string_bytes = string.encode("utf-8")  # ✅ utf-8 supports all chars
+    """Encode a string safely to URL-safe base64"""
+    string_bytes = string.encode("utf-8")
     base64_bytes = base64.urlsafe_b64encode(string_bytes)
     return base64_bytes.decode("utf-8")
 
 async def decode(base64_string: str) -> str:
-    base64_bytes = base64_string.encode("utf-8")
-    string_bytes = base64.urlsafe_b64decode(base64_bytes)
-    return string_bytes.decode("utf-8")
+    """Decode a URL-safe base64 string (handles padding errors)"""
+    try:
+        base64_bytes = base64_string.encode("utf-8")
+
+        # Fix padding if necessary
+        missing_padding = len(base64_bytes) % 4
+        if missing_padding:
+            base64_bytes += b"=" * (4 - missing_padding)
+
+        string_bytes = base64.urlsafe_b64decode(base64_bytes)
+        return string_bytes.decode("utf-8")
+    except Exception as e:
+        # Log or handle bad input gracefully
+        print(f"Decode error: {e}")
+        return ""
 # Add this class definition near your other class definitions
 # Add these imports at the top of your file
 # Add this class definition near your other class definitions
@@ -1297,7 +1469,7 @@ class NotificationManager:
 class AnimeBot:
     def __init__(self):
         self.config = Config()
-        self.db = Database()
+        self.db = Database(self)
         self.notification_manager = NotificationManager(self)
         self.app = None  # We'll set this when the client starts
         self.force_sub = ForceSub(self.db, self)  # Pass self as bot_instance
@@ -1309,7 +1481,10 @@ class AnimeBot:
         self.rate_limit = {}
         self.premium = Premium(self.db, self.config, self)
         self.quotes = AnimeQuotes(self)  # No initialize needed here
-
+        # ✅ BATCH NOTIFICATION SYSTEM (ADD THESE)
+        self.pending_anime_notifications = {}
+        self.pending_episode_notifications = defaultdict(list)
+        self.notification_lock = asyncio.Lock()
         self.settings = {
             'delete_timer': {
                 'name': 'Delete Timer',
@@ -1426,38 +1601,409 @@ class AnimeBot:
         await self.db.initialize()
         await self.force_sub.initialize()  # Add this line
         await self.notification_manager.start() # Start notification processing
+        asyncio.create_task(self.session_cleanup_task())
+        asyncio.create_task(self.start_notification_batching())
+
+            # Debug logging for update channel
+        if Config.UPDATE_CHANNEL_ID:
+            try:
+                chat = await self.app.get_chat(Config.UPDATE_CHANNEL_ID)
+                logger.info(f"Update channel configured: {chat.title} (ID: {Config.UPDATE_CHANNEL_ID})")
+            except Exception as e:
+                logger.error(f"Could not access update channel {Config.UPDATE_CHANNEL_ID}: {e}")
+        else:
+            logger.warning("No UPDATE_CHANNEL_ID configured - update notifications disabled")
+        
+        self.db.update_channel_logs = self.db.users_db.update_channel_logs
+        await self.db.update_channel_logs.create_index([("timestamp", -1)])
+        await self.db.update_channel_logs.create_index([("anime_id", 1)])
         asyncio.create_task(self.premium.validate_cache_periodically())
         asyncio.create_task(self.auto_update_ongoing_series())  # Add this line
+    async def post_to_update_channel(self, message: str, photo: str = None):
+        """Post message to update channel - supports both ID and username"""
+        channel_identifier = None
+        
+        # Try ID first, then username
+        if Config.UPDATE_CHANNEL_ID:
+            channel_identifier = Config.UPDATE_CHANNEL_ID
+        elif hasattr(Config, 'UPDATE_CHANNEL_USERNAME') and Config.UPDATE_CHANNEL_USERNAME:
+            channel_identifier = Config.UPDATE_CHANNEL_USERNAME
+        else:
+            logger.warning("No update channel configured")
+            return False
+            
+        try:
+            if photo:
+                await self.app.send_photo(
+                    chat_id=channel_identifier,
+                    photo=photo,
+                    caption=message,
+                    parse_mode=enums.ParseMode.HTML
+                )
+            else:
+                await self.app.send_message(
+                    chat_id=channel_identifier,
+                    text=message,
+                    parse_mode=enums.ParseMode.HTML
+                )
+            logger.info(f"Successfully posted to update channel: {channel_identifier}")
+            return True
+        except Exception as e:
+            logger.error(f"Error posting to update channel {channel_identifier}: {e}")
+            return False
+    async def start_notification_batching(self):
+        """Start the notification batching system"""
+        while True:
+            await asyncio.sleep(60)  # Check 5 every minute
+            await self.process_batched_notifications()
 
+    async def process_batched_notifications(self):
+        """Process batched notifications every minute"""
+        while True:
+            await asyncio.sleep(30)  # Wait 4 minutes
+            
+            async with self.notification_lock:
+                # Copy current state
+                anime_to_notify = dict(self.pending_anime_notifications)  # ✅ Now contains only anime_data
+                episodes_to_notify = {k: v[:] for k, v in self.pending_episode_notifications.items()}
+                
+                # Clear the queues
+                self.pending_anime_notifications.clear()
+                self.pending_episode_notifications.clear()
+            
+            # Send notifications
+            await self.send_batched_notifications(anime_to_notify, episodes_to_notify)
+
+    async def send_batched_notifications(self, anime_to_notify, episodes_to_notify):
+        """Send batched notifications intelligently"""
+        # For new anime WITH episodes: Send ONE combined notification
+        for anime_id in list(episodes_to_notify.keys()):
+            if anime_id in anime_to_notify:
+                # This anime is new AND has episodes - combine them!
+                anime_data = anime_to_notify[anime_id]
+                episodes_info = episodes_to_notify[anime_id]  # Now contains quality info
+                
+                await self._notify_new_anime_with_episodes(anime_data, episodes_info)
+                
+                # Remove from both queues to avoid duplicate notifications
+                del anime_to_notify[anime_id]
+                del episodes_to_notify[anime_id]
+        
+        # Notify remaining new anime (without episodes)
+        for anime_id, anime_data in anime_to_notify.items():
+            await self._notify_new_anime_immediate(anime_data)
+        
+        # Notify remaining episodes (for existing anime)
+        for anime_id, episodes_info in episodes_to_notify.items():
+            if episodes_info:
+                anime = await self.db.find_anime(anime_id)
+                if anime:
+                    await self._notify_batch_episodes(anime, episodes_info)
+
+    async def _notify_new_anime_with_episodes(self, anime_data, episodes_info):
+        """Notify about new anime WITH episodes and quality info per episode"""
+        # Group by episode number and collect qualities
+        episodes_dict = defaultdict(list)
+        
+        for info in episodes_info:
+            episodes_dict[info['episode']].append(info['quality'])
+        
+        # Format episode-quality pairs
+        episode_sections = []
+        for episode, qualities in sorted(episodes_dict.items()):
+            # Remove duplicates and sort qualities by resolution
+            unique_qualities = sorted(set(qualities), key=lambda x: self._parse_quality(x), reverse=True)
+            quality_list = ", ".join([q.upper() for q in unique_qualities])
+            episode_sections.append(f"   • Episode {episode} [{quality_list}]")
+        
+        message = (
+            "🎉 <b>New Anime Added with Episodes!</b>\n\n"
+            f"🎬 <b>Title:</b> {html.escape(anime_data.get('title', 'Unknown Anime'))}\n"
+            f"📺 <b>Type:</b> {anime_data.get('type', 'TV')}\n"
+            f"📊 <b>Episodes Available:</b>\n" + "\n".join(episode_sections) + "\n\n"
+            f"⭐ <b>Rating:</b> {anime_data.get('score', 0)/10 if anime_data.get('score') else 'N/A'}/10\n"
+            f"🏷️ <b>Genres:</b> {', '.join(anime_data.get('genres', []))}\n\n"
+            f"🔗 <a href='{anime_data.get('url', '')}'>View on AniList</a>\n"
+            f"🔍 Search: <code>{html.escape(anime_data.get('title', ''))}</code>"
+        )
+        
+        cover_url = anime_data.get("cover_url", Config.COVER_PIC)
+        await self.post_to_update_channel(message, cover_url)
+    async def _notify_batch_episodes(self, anime, episodes_info):
+        """Notify about batched episodes with quality information per episode"""
+        # Group by episode number and collect qualities
+        episodes_dict = defaultdict(list)
+        
+        for info in episodes_info:
+            episodes_dict[info['episode']].append(info['quality'])
+        
+        # Format episode-quality pairs
+        episode_sections = []
+        for episode, qualities in sorted(episodes_dict.items()):
+            # Remove duplicates and sort qualities by resolution
+            unique_qualities = sorted(set(qualities), key=lambda x: self._parse_quality(x), reverse=True)
+            quality_list = ", ".join([q.upper() for q in unique_qualities])
+            episode_sections.append(f"   • Episode {episode} [{quality_list}]")
+        
+        message = (
+            "📦 <b>New Episodes Added!</b>\n\n"
+            f"🎬 <b>Anime:</b> {html.escape(anime.get('title', 'Unknown Anime'))}\n"
+            f"📺 <b>Episodes:</b>\n" + "\n".join(episode_sections) + "\n\n"
+            f"📊 <b>Total Files:</b> {len(episodes_info)}\n\n"
+            f"🔗 <a href='{anime.get('url', '')}'>View on AniList</a>\n"
+            f"🔍 Search: <code>{html.escape(anime.get('title', ''))}</code>"
+        )
+        
+        # ✅ Add cover image like in _notify_new_anime_with_episodes
+        cover_url = anime.get("cover_url", Config.COVER_PIC)
+        await self.post_to_update_channel(message, cover_url)
+
+
+    def _format_episode_range(self, episodes: list) -> str:
+        """Format episode list into proper ranges (e.g., 1-25)"""
+        if not episodes:
+            return "None"
+        
+        # Remove duplicates and sort
+        episodes = sorted(set(episodes))
+        ranges = []
+        start = episodes[0]
+        end = episodes[0]
+        
+        for i in range(1, len(episodes)):
+            if episodes[i] == end + 1:
+                # Continuous episode, extend the range
+                end = episodes[i]
+            else:
+                # Break in continuity, add current range
+                if start == end:
+                    ranges.append(str(start))
+                else:
+                    ranges.append(f"{start}-{end}")
+                start = end = episodes[i]
+        
+        # Add the last range
+        if start == end:
+            ranges.append(str(start))
+        else:
+            ranges.append(f"{start}-{end}")
+        
+        return ", ".join(ranges)
+    def _parse_quality(self, quality_str):
+        """Helper to parse quality strings for sorting (360p -> 360, 720p -> 720 etc.)"""
+        if not quality_str or not isinstance(quality_str, str):
+            return 0
+        
+        try:
+            # Extract first sequence of digits and convert to int
+            digits = ''.join(c for c in quality_str if c.isdigit())
+            return int(digits) if digits else 0
+        except (ValueError, TypeError):
+            return 0
+    async def queue_new_anime(self, anime_data):
+        """Queue new anime for batched notification"""
+        async with self.notification_lock:
+            # ✅ STORE ONLY THE anime_data, NOT tuple!
+            self.pending_anime_notifications[anime_data["id"]] = anime_data
+
+    async def queue_new_episode(self, file_data):
+        """Queue new episode for batched notification with quality info"""
+        async with self.notification_lock:
+            # Store episode number AND quality
+            episode_info = {
+                'episode': file_data["episode"],
+                'quality': file_data.get("quality", "Unknown")
+            }
+            self.pending_episode_notifications[file_data["anime_id"]].append(episode_info)
+    async def _notify_new_anime_immediate(self, anime_data):
+        """Notify about new anime addition"""
+        logger.info(f"NOTIFY: Starting new anime notification for {anime_data.get('title', 'Unknown')}")
+        
+        if not Config.POST_NEW_ANIME:
+            logger.info("NOTIFY: POST_NEW_ANIME is disabled, skipping notification")
+            return
+            
+        try:
+            # Format the message
+            message = Config.NEW_ANIME_TEMPLATE.format(
+                title=html.escape(anime_data.get("title", "Unknown")),
+                type=html.escape(anime_data.get("type", "TV")),
+                episodes=anime_data.get("episodes", "?"),
+                rating=anime_data.get("score", 0) / 10 if anime_data.get("score") else "N/A",
+                genres=", ".join(anime_data.get("genres", [])),
+                year=anime_data.get("year", "Unknown"),
+                url=anime_data.get("url", ""),
+                search_query=html.escape(anime_data.get("title", ""))
+            )
+            
+            logger.info(f"NOTIFY: Formatted message for {anime_data.get('title', 'Unknown')}")
+            
+            # Post to update channel
+            cover_url = anime_data.get("cover_url", Config.COVER_PIC)
+            success = await self.post_to_update_channel(message, cover_url)
+            
+            if success:
+                logger.info(f"NOTIFY: Successfully posted new anime: {anime_data.get('title', 'Unknown')}")
+                # Log to database only if posting was successful
+                await self.db.log_new_anime(anime_data)
+            else:
+                logger.warning(f"NOTIFY: Failed to post new anime: {anime_data.get('title', 'Unknown')}")
+                
+        except Exception as e:
+            logger.error(f"NOTIFY: Error notifying new anime: {e}")
+    async def notify_new_episode(self, file_data: dict):
+        """Notify about new episode addition - groups same episode with different qualities"""
+        logger.info(f"NOTIFY: Starting new episode notification for anime {file_data['anime_id']}, episode {file_data['episode']}")
+        
+        if not Config.POST_NEW_EPISODES:
+            logger.info("NOTIFY: POST_NEW_EPISODES is disabled, skipping notification")
+            return
+            
+        try:
+            # Get anime details
+            anime = await self.db.find_anime(file_data["anime_id"])
+            if not anime:
+                logger.warning(f"NOTIFY: Anime not found for file: {file_data['anime_id']}")
+                return
+                
+            logger.info(f"NOTIFY: Found anime: {anime.get('title', 'Unknown')}")
+            
+            # Check if this is an ongoing series
+            is_ongoing = anime.get("status") == "RELEASING"
+            logger.info(f"NOTIFY: Is ongoing series: {is_ongoing}")
+            
+            # ✅ CHECK IF SAME EPISODE ALREADY EXISTS WITH DIFFERENT QUALITY
+            existing_files = await self.db.find_files(file_data["anime_id"], file_data["episode"])
+            existing_qualities = {f.get("quality", "Unknown").lower() for f in existing_files if f.get("quality")}
+            new_quality = file_data.get("quality", "Unknown").lower()
+            
+            # If this quality already exists for this episode, skip notification
+            if new_quality in existing_qualities:
+                logger.info(f"NOTIFY: Quality {new_quality} already exists for episode {file_data['episode']}, skipping notification")
+                return
+                
+            # ✅ GET ALL QUALITIES FOR THIS EPISODE (including the new one)
+            all_qualities = list(existing_qualities)
+            all_qualities.append(new_quality)
+            all_qualities = sorted(set(all_qualities), key=lambda x: self._parse_quality(x), reverse=True)
+            quality_text = ", ".join([q.upper() for q in all_qualities])
+            
+            # FIX: Handle None values
+            quality = file_data.get("quality", "Unknown")
+            if quality is None:
+                quality = "Unknown"
+                
+            language = file_data.get("language", "Unknown") 
+            if language is None:
+                language = "Unknown"
+            
+            # ✅ MODIFIED MESSAGE TO SHOW ALL QUALITIES
+            message = (
+                "📢 <b>New Episode Available!</b>\n\n"
+                f"🎬 <b>Anime:</b> {html.escape(anime.get('title', 'Unknown Anime'))}\n"
+                f"📺 <b>Episode:</b> {file_data['episode']} [{quality_text}]\n"
+                f"🗣️ <b>Language:</b> {language.upper()}\n\n"
+                f"🔗 <a href='{anime.get('url', '')}'>View on AniList</a>\n"
+                f"⬇️ Download: <code>/dl_{file_data.get('file_id', '')}</code>"
+            )
+            
+            logger.info(f"NOTIFY: Formatted episode message for {anime.get('title', 'Unknown')}")
+            
+            # Post to update channel
+            success = await self.post_to_update_channel(message)
+            
+            if success:
+                logger.info(f"NOTIFY: Successfully posted new episode: {anime.get('title', 'Unknown')} EP{file_data['episode']}")
+                # Log to database only if posting was successful
+                await self.db.log_new_episode(file_data)
+                
+                # If it's an ongoing series, also post ongoing update
+                if is_ongoing and Config.POST_ONGOING_UPDATES:
+                    logger.info(f"NOTIFY: Posting ongoing update for {anime.get('title', 'Unknown')}")
+                    await self.notify_ongoing_update(anime, file_data["episode"])
+            else:
+                logger.warning(f"NOTIFY: Failed to post new episode: {anime.get('title', 'Unknown')} EP{file_data['episode']}")
+                
+        except Exception as e:
+            logger.error(f"NOTIFY: Error notifying new episode: {e}")
+    async def send_immediate_ongoing_update(self, anime_id: int, new_episode: int):
+        """Send immediate ongoing update when new episode is added"""
+        try:
+            # Get anime details
+            anime = await self.db.find_anime(anime_id)
+            if not anime or anime.get("status") != "RELEASING":
+                return False
+            
+            # Get watchlist count
+            watchlist_count = await self.db.get_watchlist_count(anime_id)
+            
+            # Get total uploaded episodes
+            total_uploaded = await self.db.count_episodes(anime_id, count_unique=True)
+            
+            # Get latest episode quality
+            latest_quality = "Unknown"
+            latest_files = await self.db.find_files(anime_id, new_episode)
+            if latest_files:
+                qualities = [f.get("quality", "Unknown") for f in latest_files if f.get("quality")]
+                if qualities:
+                    latest_quality = max(qualities, key=lambda x: self._parse_quality(x))
+            
+            # Format immediate update message
+            message = (
+                "🆕 <b>New Episode Added to Ongoing Series!</b>\n\n"
+                f"🎬 <b>Anime:</b> {html.escape(anime.get('title', 'Unknown Anime'))}\n"
+                f"📺 <b>Latest Episode:</b> {new_episode} [{latest_quality.upper()}]\n"
+                f"📊 <b>Progress:</b> {total_uploaded}/{anime.get('episodes', '?')} episodes\n"
+                f"🏷️ <b>Status:</b> {anime.get('status', 'Unknown').replace('_', ' ').title()}\n\n"
+                f"👥 <b>Watchlist:</b> {watchlist_count} users\n"
+                f"🔗 <a href='{anime.get('url', '')}'>View on AniList</a>\n\n"
+                f"💫 Use <code>/watchlist</code> to track your favorite ongoing series!"
+            )
+            
+            # Post to update channel with anime cover
+            cover_url = anime.get("cover_url", Config.COVER_PIC)
+            success = await self.post_to_update_channel(message, cover_url)
+            
+            if success:
+                logger.info(f"Sent immediate ongoing update for {anime.get('title')} EP{new_episode}")
+                return True
+                
+        except Exception as e:
+            logger.error(f"Error sending immediate ongoing update: {e}")
+        
+        return False
+    # Fix the session management in AnimeBot class
     def get_user_session(self, user_id: int, message_id: int = None):
         """Get user session data with automatic cleanup"""
         now = datetime.now()
         
         # First clean up expired sessions
         expired_keys = []
-        for key, session in self.user_sessions.items():
-            if isinstance(key, int):  # User ID based session
-                last_active = session.get('last_active')
-                if last_active and (now - last_active).total_seconds() > 300:  # 5 minutes
-                    expired_keys.append(key)
-            elif isinstance(key, tuple):  # Message ID based session
-                last_active = session.get('last_active')
-                if last_active and (now - last_active).total_seconds() > 300:
-                    expired_keys.append(key)
+        for key, session in list(self.user_sessions.items()):
+            last_active = session.get('last_active')
+            if last_active and (now - last_active).total_seconds() > 300:  # 5 minutes
+                expired_keys.append(key)
         
         for key in expired_keys:
-            del self.user_sessions[key]
+            try:
+                del self.user_sessions[key]
+            except KeyError:
+                pass
         
         # Now get the requested session
         if message_id:
-            return self.user_sessions.get((user_id, message_id), {}).get('data', {})
-        return self.user_sessions.get(user_id, {})
+            session_key = (user_id, message_id)
+            return self.user_sessions.get(session_key, {}).get('data', {})
+        else:
+            return self.user_sessions.get(user_id, {})
 
     def set_user_session(self, user_id: int, data: dict, message_id: int = None):
+        """Set user session data"""
         data['last_active'] = datetime.now()
-
+        
         if message_id:
-            self.user_sessions[message_id] = {
+            session_key = (user_id, message_id)
+            self.user_sessions[session_key] = {
                 'data': data,
                 'original_user': user_id,
                 'last_active': datetime.now()
@@ -1468,37 +2014,46 @@ class AnimeBot:
     def clear_user_session(self, user_id: int, message_id: int = None):
         """Clear user session"""
         if message_id:
-            if (user_id, message_id) in self.user_sessions:
-                del self.user_sessions[(user_id, message_id)]
+            session_key = (user_id, message_id)
+            if session_key in self.user_sessions:
+                del self.user_sessions[session_key]
         elif user_id in self.user_sessions:
             del self.user_sessions[user_id]
 
     async def session_cleanup_task(self):
+        """Background task to clean up expired sessions"""
         while True:
-            now = datetime.now()
-            expired_keys = []
-
-            for key, session in self.user_sessions.items():
-                last_active = session.get('last_active')
-                if last_active and (now - last_active).total_seconds() > 300:
-                    expired_keys.append(key)
-
-            for key in expired_keys:
-                try:
-                    original_user = self.user_sessions[key].get('original_user')
-                    if original_user:
-                        try:
-                            await self.bot.send_message(
-                                chat_id=original_user,
-                                text="⌛ Your session has expired due to inactivity. Please start again."
-                            )
-                        except:
-                            pass
-                    del self.user_sessions[key]
-                except Exception as e:
-                    logger.error(f"Error cleaning session {key}: {e}")
-
-            await asyncio.sleep(60)
+            try:
+                now = datetime.now()
+                expired_keys = []
+                
+                for key, session in list(self.user_sessions.items()):
+                    last_active = session.get('last_active')
+                    if last_active and (now - last_active).total_seconds() > 300:
+                        expired_keys.append(key)
+                
+                for key in expired_keys:
+                    try:
+                        # Notify user if it's a message-based session
+                        if isinstance(key, tuple) and len(key) == 2:
+                            user_id, message_id = key
+                            try:
+                                await self.app.send_message(
+                                    chat_id=user_id,
+                                    text="⌛ Your session has expired due to inactivity. Please start again."
+                                )
+                            except Exception:
+                                pass
+                        
+                        del self.user_sessions[key]
+                    except KeyError:
+                        pass
+                    
+                await asyncio.sleep(60)  # Check every minute
+                
+            except Exception as e:
+                logger.error(f"Error in session cleanup task: {e}")
+                await asyncio.sleep(60)
 
 
     async def check_rate_limit(self, user_id: int, chat_id: int = None) -> bool:
@@ -1551,16 +2106,16 @@ class AnimeBot:
             from datetime import datetime, timedelta
             import psutil
             import asyncio
-    
+
             def format_timedelta(td: timedelta) -> str:
                 days = td.days
                 hours, remainder = divmod(td.seconds, 3600)
                 minutes, seconds = divmod(remainder, 60)
                 return f"{days}d {hours}h {minutes}m {seconds}s"
-    
+
             def format_mb(bytes_value):
                 return f"{bytes_value / 1024 / 1024:.2f}MB"
-    
+
             async def get_uptime() -> timedelta:
                 try:
                     with open('/proc/uptime', 'r') as f:
@@ -1568,25 +2123,25 @@ class AnimeBot:
                     return timedelta(seconds=int(uptime_seconds))
                 except Exception:
                     return datetime.now() - datetime.fromtimestamp(psutil.boot_time())
-    
+
             # 🖥️ System info
             memory = psutil.virtual_memory()
             disk = psutil.disk_usage('/')
             cpu_percent = psutil.cpu_percent(interval=0.5)
             uptime = await get_uptime()
-    
+
             # 👥 User stats
             stats = await self.db.stats_collection.find_one({"type": "global"}) or {}
             total_users = await self.db.users_collection.count_documents({})
             premium_users = await self.db.premium_users.count_documents({
                 "expiry_date": {"$gt": datetime.now()}
             })
-    
+
             # 📦 Cluster stats
             cluster_info = []
             total_anime = 0
             total_files = 0
-    
+
             if not hasattr(self.db, 'anime_clients') or not self.db.anime_clients:
                 cluster_info.append("🔹 No database clusters configured or initialized")
             else:
@@ -1597,11 +2152,11 @@ class AnimeBot:
                         files_count = await db.files.estimated_document_count()
                         total_anime += anime_count
                         total_files += files_count
-    
+
                         db_stats = await db.command("dbStats")
                         data_size_mb = db_stats.get('dataSize', 0) / (1024 * 1024)
                         index_size_mb = db_stats.get('indexSize', 0) / (1024 * 1024)
-    
+
                         cluster_info.append(
                             f"🔹 <b>Cluster {i}</b><br>"
                             f"   • Status: ✅ Online<br>"
@@ -1616,15 +2171,15 @@ class AnimeBot:
                             f"   • Status: ❌ Offline<br>"
                             f"   • Error: <code>{str(e)[:100]}</code>"
                         )
-    
+
             total_episodes = await self.count_total_episodes(count_unique=True)
-    
+
             # 👤 User DB status
             try:
                 user_stats = await self.db.users_client[self.db.db_name].command("dbStats")
                 user_data_size = user_stats.get('dataSize', 0) / (1024 * 1024)
                 user_index_size = user_stats.get('indexSize', 0) / (1024 * 1024)
-    
+
                 user_db_info = (
                     f"👤 <b>Users Database</b><br>"
                     f"   • Status: ✅ Online<br>"
@@ -1639,12 +2194,12 @@ class AnimeBot:
                     f"   • Status: ❌ Offline<br>"
                     f"   • Error: <code>{str(e)[:100]}</code>"
                 )
-    
+
             # 📊 Insert distribution
             insert_stats = getattr(self.db, 'insert_stats', {})
             total_inserts = insert_stats.get('total_inserts', 0)
             cluster_counts = insert_stats.get('cluster_counts', {})
-    
+
             if total_inserts > 0:
                 cluster_dist = [
                     f"🔹 Cluster {i}: <code>{count}</code> inserts "
@@ -1653,7 +2208,7 @@ class AnimeBot:
                 ]
             else:
                 cluster_dist = ["No insert activity yet."]
-    
+
             # 📄 Final message
             message_text = (
                 f"<b>📊 {Config.BOT_NAME} Status</b>\n\n"
@@ -1685,18 +2240,19 @@ class AnimeBot:
                 + "\n".join(cluster_dist)
             )
 
-    
             sent_msg = await message.reply_text(
                 message_text,
                 parse_mode=enums.ParseMode.HTML,
                 disable_web_page_preview=True
             )
+
             await asyncio.sleep(120)
             await sent_msg.delete()
-    
+
         except Exception as e:
             logger.error(f"Status command error: {e}", exc_info=True)
             await message.reply_text("⚠️ Error retrieving status information.")
+
 
     async def get_anime_title(self, anime_id: int) -> str:
         anime = await self.db.find_anime(anime_id)
@@ -1764,15 +2320,17 @@ class AnimeBot:
                 keyboard.append(row)
 
             keyboard.append([
-                InlineKeyboardButton("🔙 Back", callback_data="start_menu"),
-                InlineKeyboardButton("❌ Close", callback_data="close_message")
+                InlineKeyboardButton("• ʙᴀᴄᴋ •", callback_data="start_menu"),
+                InlineKeyboardButton("• ᴄʟᴏꜱᴇ •", callback_data="close_message")
             ])
 
             # Use a different picture for browse if available, or fallback to START_PIC
-            browse_pic = "https://files.catbox.moe/qqa869.jpg"  # Replace with your actual browse picture URL
+            random_start_pic = random.choice(Config.START_PICS)
+
+         #   browse_pic = "https://files.catbox.moe/qqa869.jpg"  # Replace with your actual browse picture URL
             try:
                 await message.reply_photo(
-                    photo=browse_pic,
+                    photo=random_start_pic,
                     caption="📚 Browse Anime by Letter\nSelect a letter to browse anime:",
                     reply_markup=InlineKeyboardMarkup(keyboard)
                 )
@@ -1867,19 +2425,21 @@ class AnimeBot:
     
             # Back & Close buttons
             keyboard.append([
-                InlineKeyboardButton("🔙 Back", callback_data="start_menu"),
-                InlineKeyboardButton("❌ Close", callback_data="close_message")
+                InlineKeyboardButton("• ʙᴀᴄᴋ •", callback_data="start_menu"),
+                InlineKeyboardButton("• ᴄʟᴏꜱᴇ •", callback_data="close_message")
             ])
-    
+            random_start_pic = random.choice(Config.START_PICS)
             # --- Final reply ---
-            await message.reply_text(
-                "<blockquote>⭐ <b>Your Watchlist</b></blockquote>\n\n"
-                "<blockquote>🔄 = Currently releasing new episodes</blockquote>\n"
-                "Select an anime to view details:",
+            await message.reply_photo(
+                photo=random_start_pic,  # Use random picture
+                caption=(
+                    "<blockquote>⭐ <b>Your Watchlist</b></blockquote>\n\n"
+                    "<blockquote>🔄 = Currently releasing new episodes</blockquote>\n"
+                    "Select an anime to view details:"
+                ),
                 reply_markup=InlineKeyboardMarkup(keyboard),
                 parse_mode=enums.ParseMode.HTML
             )
-
         except Exception as e:
             logger.error(f"Error in watchlist command: {e}")
             await message.reply_text("⚠️ Error loading your watchlist. Please try again.")
@@ -2087,24 +2647,48 @@ class AnimeBot:
             keyboard.inline_keyboard.append([
                 InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")
             ])
+        random_start_pic = random.choice(Config.START_PICS)
 
+        
         try:
+            # Only use message effects in private chats
+            if message.chat.type == enums.ChatType.PRIVATE:
                 await message.reply_photo(
-                photo=Config.START_PIC,
-                caption=welcome_text,
-                reply_markup=keyboard,
-                parse_mode=enums.ParseMode.HTML  # Make sure this is set!
-
+                    photo=random_start_pic,
+                    caption=welcome_text,
+                    reply_markup=keyboard,
+                    parse_mode=enums.ParseMode.HTML,
+                    message_effect_id=random.choice(Config.MESSAGE_EFFECT_IDS)
+                )
+            else:
+                await message.reply_photo(
+                    photo=random_start_pic,
+                    caption=welcome_text,
+                    reply_markup=keyboard,
+                    parse_mode=enums.ParseMode.HTML
+                )
                 
-            )
-
         except Exception as e:
-            logger.error(f"Error sending start message: {e}")
-            await message.reply_text("⚠️ Error starting bot. Please try again.")
+            logger.warning(f"Error with message effect, retrying without: {e}")
+            try:
+                await message.reply_photo(
+                    photo=random_start_pic,
+                    caption=welcome_text,
+                    reply_markup=keyboard,
+                    parse_mode=enums.ParseMode.HTML
+                )
+            except Exception as e2:
+                logger.error(f"Error sending start message: {e2}")
+                await message.reply_text("⚠️ Error starting bot. Please try again.")
 
     async def search_anime(self, client: Client, message: Message):
         try:
-            await message.reply_text("🔍 *Enter the anime name to search:*")
+            random_start_pic = random.choice(Config.START_PICS)
+        
+            await message.reply_photo(
+                photo=random_start_pic,  # Use random picture
+                caption="🔍 *Enter the anime name to search:*"
+            )
             self.user_sessions[message.from_user.id] = {'awaiting_search': True}
         except Exception as e:
             logger.error(f"Error in search_anime: {e}")
@@ -2129,8 +2713,8 @@ class AnimeBot:
                 ])
     
             keyboard.append([
-                InlineKeyboardButton("🔙 Back", callback_data="start_menu"),
-                InlineKeyboardButton("❌ Close", callback_data="close_message")
+                InlineKeyboardButton("• ʙᴀᴄᴋ •", callback_data="start_menu"),
+                InlineKeyboardButton("• ᴄʟᴏꜱᴇ •", callback_data="close_message")
             ])
     
             reply_markup = InlineKeyboardMarkup(keyboard)
@@ -2141,13 +2725,15 @@ class AnimeBot:
                 "<blockquote>📝 Note: Add <b>ongoing anime</b> to your watchlist to get notified when new episodes are added!</blockquote>\n"
                 "<blockquote>💡 Tip: Use the <code>/ongoing</code> command to see the current list of ongoing anime.</blockquote>"
             )
-    
+            random_start_pic = random.choice(Config.START_PICS)
+
             await self.update_message(
                 client,
                 callback_query.message,
                 text,
                 reply_markup=reply_markup,
-                parse_mode=enums.ParseMode.HTML
+                parse_mode=enums.ParseMode.HTML,
+                photo=random_start_pic  # Use random picture
             )
         except Exception as e:
             logger.error(f"Error viewing watchlist: {e}")
@@ -2206,7 +2792,7 @@ class AnimeBot:
             # Add back button
             keyboard.append([
                 InlineKeyboardButton("🔙 Back to Anime", callback_data=f"anime_{anime_id}"),
-                InlineKeyboardButton("❌ Close", callback_data="close_message")
+                InlineKeyboardButton("• ᴄʟᴏꜱᴇ •", callback_data="close_message")
             ])
 
             anime = await self.db.find_anime(anime_id)
@@ -2244,14 +2830,14 @@ class AnimeBot:
                 ])
 
             # Add bulk download button for the entire saga
-            keyboard.append([
-                InlineKeyboardButton("📥 Download Entire Saga", callback_data=f"bulk_saga_{anime_id}_{saga_id}")
-            ])
+         #   keyboard.append([
+         #       InlineKeyboardButton("📥 Download Entire Saga", callback_data=f"bulk_saga_{anime_id}_{saga_id}")
+          #  ])
 
             # Add navigation buttons
             keyboard.append([
                 InlineKeyboardButton("🔙 Back to Sagas", callback_data=f"sagas_{anime_id}"),
-                InlineKeyboardButton("❌ Close", callback_data="close_message")
+                InlineKeyboardButton("• ᴄʟᴏꜱᴇ •", callback_data="close_message")
             ])
 
             anime = await self.db.find_anime(anime_id)
@@ -2326,13 +2912,13 @@ class AnimeBot:
 
             # Add bulk download for the arc
             keyboard.append([
-                InlineKeyboardButton("📥 Download Entire Arc", callback_data=f"bulk_arc_{anime_id}_{saga_id}_{arc_id}")
+                InlineKeyboardButton("📥 Download Entire Arc", callback_data=f"arc_bulk_{anime_id}_{saga_id}_{arc_id}")
             ])
 
             # Add navigation buttons
             keyboard.append([
                 InlineKeyboardButton("🔙 Back to Arcs", callback_data=f"saga_{anime_id}_{saga_id}"),
-                InlineKeyboardButton("❌ Close", callback_data="close_message")
+                InlineKeyboardButton("• ᴄʟᴏꜱᴇ •", callback_data="close_message")
             ])
 
             anime = await self.db.find_anime(anime_id)
@@ -2354,7 +2940,74 @@ class AnimeBot:
         except Exception as e:
             logger.error(f"Error showing arc episodes: {e}")
             await callback_query.answer("Error loading episodes.", show_alert=True)
-        
+    async def show_arc_quality_menu(self, client: Client, callback_query: CallbackQuery, anime_id: int, saga_id: int, arc_id: int):
+        """Show quality options for arc bulk download"""
+        try:
+            # Get available qualities for this arc
+            all_files = await self.db.find_files(anime_id)
+            
+            # Get arc episode range to filter files
+            sagas = await self.db.get_anime_sagas(anime_id)
+            saga = next((s for s in sagas if s["id"] == saga_id), None)
+            if not saga:
+                await callback_query.answer("Saga not found.", show_alert=True)
+                return
+                
+            arc = next((a for a in saga["arcs"] if a["id"] == arc_id), None)
+            if not arc:
+                await callback_query.answer("Arc not found.", show_alert=True)
+                return
+            
+            # Parse episode range
+            start_ep, end_ep, error = await self.parse_episode_range(arc["episode_range"], anime_id)
+            if error:
+                await callback_query.answer(error, show_alert=True)
+                return
+            
+            # Filter files for this arc's episode range
+            arc_files = [f for f in all_files if start_ep <= f['episode'] <= end_ep]
+            
+            # Get unique qualities
+            qualities = set()
+            for file in arc_files:
+                if 'quality' in file and file['quality']:
+                    qualities.add(file['quality'].lower())
+            
+            if not qualities:
+                await callback_query.answer("No files available for this arc.", show_alert=True)
+                return
+            
+            # Create quality buttons
+            keyboard = []
+            for quality in sorted(qualities):
+                # Count episodes available in this quality
+                quality_episodes = len(set(f['episode'] for f in arc_files if f.get('quality', '').lower() == quality))
+                btn_text = f"{quality.upper()} ({quality_episodes} episodes)"
+                callback_data = f"bulk_arc_{anime_id}_{saga_id}_{arc_id}_{quality}"
+                keyboard.append([InlineKeyboardButton(btn_text, callback_data=callback_data)])
+            
+            # Add back button
+            keyboard.append([
+                InlineKeyboardButton("🔙 Back to Arc", callback_data=f"arc_{anime_id}_{saga_id}_{arc_id}"),
+                InlineKeyboardButton("• ᴄʟᴏꜱᴇ •", callback_data="close_message")
+            ])
+            
+            # Get arc info for display
+            anime = await self.db.find_anime(anime_id)
+            arc_name = arc.get('name', 'Unknown Arc')
+            
+            await self.update_message(
+                client,
+                callback_query.message,
+                f"<b>Select quality for {arc_name}</b>\n"
+                f"<i>Part of {anime['title']}</i>\n\n"
+                "All available episodes will be sent to your PM:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            
+        except Exception as e:
+            logger.error(f"Error in show_arc_quality_menu: {e}")
+            await callback_query.answer("Error loading quality options.", show_alert=True)     
     async def show_anime_details(self, client: Client, callback_query: CallbackQuery, anime_id: int):
         try:
             user_id = callback_query.from_user.id
@@ -2762,13 +3415,7 @@ class AnimeBot:
         except ValueError:
             return None, None, "Invalid episode range format"
 
-    async def show_bulk_quality_menu(
-        self, 
-        client: Client, 
-        callback_query: CallbackQuery, 
-        anime_id: int, 
-        bulk_data: str = None
-    ):
+    async def show_bulk_quality_menu(self, client: Client, callback_query: CallbackQuery, anime_id: int, bulk_data: str = None):
         """Show quality options for bulk download - with saga/arc support"""
         try:
             # Parse bulk_data to determine if this is for saga/arc or entire anime
@@ -2910,14 +3557,14 @@ class AnimeBot:
                 saga_id = int(parts[3])
                 back_data = f"saga_{anime_id}_{saga_id}" if is_saga else f"arc_{anime_id}_{saga_id}_{parts[4]}"
                 buttons.append([
-                    InlineKeyboardButton("🔙 Back", callback_data=back_data),
-                    InlineKeyboardButton("❌ Close", callback_data="close_message")
+                    InlineKeyboardButton("• ʙᴀᴄᴋ •", callback_data=back_data),
+                    InlineKeyboardButton("• ᴄʟᴏꜱᴇ •", callback_data="close_message")
                 ])
             else:
                 # For regular bulk, go back to anime
                 buttons.append([
-                    InlineKeyboardButton("🔙 Back", callback_data=f"anime_{anime_id}"),
-                    InlineKeyboardButton("❌ Close", callback_data="close_message")
+                    InlineKeyboardButton("• ʙᴀᴄᴋ •", callback_data=f"anime_{anime_id}"),
+                    InlineKeyboardButton("• ᴄʟᴏꜱᴇ •", callback_data="close_message")
                 ])
 
             reply_markup = InlineKeyboardMarkup(buttons)
@@ -2949,14 +3596,17 @@ class AnimeBot:
                 quality = parts[4]
                 await self.process_bulk_saga_download(client, callback_query, anime_id, saga_id, quality)
                 
-            elif data.startswith("bulk_arc_") and len(parts) >= 6:
-                # Format: bulk_arc_{anime_id}_{saga_id}_{arc_id}_{quality}
-                anime_id = int(parts[2])
-                saga_id = int(parts[3])
-                arc_id = int(parts[4])
-                quality = parts[5]
-                await self.process_bulk_arc_download(client, callback_query, anime_id, saga_id, arc_id, quality)
-                
+            elif data.startswith("bulk_arc_"):
+            # Format: bulk_arc_{anime_id}_{saga_id}_{arc_id}_{quality}
+                parts = data.split('_')
+                if len(parts) >= 6:
+                    anime_id = int(parts[2])
+                    saga_id = int(parts[3])
+                    arc_id = int(parts[4])
+                    quality = parts[5]
+                    await self._process_bulk_arc_download(client, callback_query, anime_id, saga_id, arc_id, quality)
+                else:
+                    await callback_query.answer("Invalid bulk arc format.", show_alert=True)
             elif data.startswith("bulk_") and len(parts) >= 3:
                 # Format: bulk_{quality}_{anime_id}
                 quality = parts[1]
@@ -3727,12 +4377,34 @@ class AnimeBot:
             logger.critical(f"Download failed: {str(main_error)}")
             await callback_query.answer("❌ Download error occurred", show_alert=True)
 
-    async def ongoing_command(self, client: Client, message: Message, page: int = 1):
+ 
+    async def ongoing_command(self, client: Client, message: Message | CallbackQuery, page: int = 1):
         """Show paginated list of currently releasing anime"""
         try:
-            ITEMS_PER_PAGE = 10  # Number of items per page
-            
-            # Search across all clusters for anime with status "RELEASING"
+            # Step 1: Send initial loading message (text only)
+            if isinstance(message, CallbackQuery):
+                loading_msg = await message.message.edit_text("⏳ Loading")
+            else:
+                loading_msg = await message.reply_text("⏳ Loading")
+
+            # Step 2: Start background animation (dots)
+            stop_animation = asyncio.Event()
+
+            async def animate_loading():
+                dots = ["⏳ Loading", "⏳ Loading.", "⏳ Loading..", "⏳ Loading..."]
+                i = 0
+                while not stop_animation.is_set():
+                    try:
+                        await loading_msg.edit_text(dots[i % len(dots)])
+                    except Exception:
+                        pass
+                    i += 1
+                    await asyncio.sleep(0.5)
+
+            animation_task = asyncio.create_task(animate_loading())
+
+            # Step 3: Collect from DBs (heavy work)
+            ITEMS_PER_PAGE = 10
             releasing_anime = []
             for db_client in self.db.anime_clients:
                 try:
@@ -3747,25 +4419,26 @@ class AnimeBot:
                     continue
 
             # Deduplicate
-            seen_ids = set()
-            unique_anime = []
+            seen_ids, unique_anime = set(), []
             for anime in releasing_anime:
                 if anime["id"] not in seen_ids:
                     seen_ids.add(anime["id"])
                     unique_anime.append(anime)
 
             if not unique_anime:
-                await message.reply_text("ℹ️ No currently releasing anime found.")
+                stop_animation.set()
+                await animation_task
+                await loading_msg.edit_text("ℹ️ No currently releasing anime found.")
                 return
 
-            # Calculate pagination
+            # Pagination
             total_pages = (len(unique_anime) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE
-            page = max(1, min(page, total_pages))  # Clamp page to valid range
+            page = max(1, min(page, total_pages))
             start_idx = (page - 1) * ITEMS_PER_PAGE
             end_idx = start_idx + ITEMS_PER_PAGE
             page_anime = unique_anime[start_idx:end_idx]
 
-            # Create keyboard buttons
+            # Build keyboard
             keyboard = []
             for anime in page_anime:
                 try:
@@ -3775,45 +4448,45 @@ class AnimeBot:
                     total_uploaded = 0
 
                 btn_text = f"{anime['title']} ({total_uploaded}/{anime.get('episodes', '?')})"
-                keyboard.append([
-                    InlineKeyboardButton(btn_text, callback_data=f"anime_{anime['id']}")
-                ])
-            # Pagination controls
+                keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"anime_{anime['id']}")])
+
             pagination_buttons = []
             if page > 1:
                 pagination_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"ongoing_page_{page-1}"))
-            
             pagination_buttons.append(InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
-            
             if page < total_pages:
                 pagination_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"ongoing_page_{page+1}"))
-
             if pagination_buttons:
                 keyboard.append(pagination_buttons)
 
             keyboard.append([
-                InlineKeyboardButton("🔙 Back", callback_data="start_menu"),
-                InlineKeyboardButton("❌ Close", callback_data="close_message")
+                InlineKeyboardButton("• ʙᴀᴄᴋ •", callback_data="start_menu"),
+                InlineKeyboardButton("• ᴄʟᴏꜱᴇ •", callback_data="close_message")
             ])
 
-            # Try to edit if it's a callback, otherwise send new message
-            if isinstance(message, CallbackQuery):
-                await self.update_message(
-                    client,
-                    message.message,
-                    f"<blockquote>🔄 Currently Releasing Anime (Page {page}/{total_pages}):</blockquote>\n"
-                    f"<blockquote>Numbers show uploaded/total episodes</blockquote>\n"
-                    f"<blockquote>Select an anime to view details:</blockquote>",
-                    reply_markup=InlineKeyboardMarkup(keyboard)
-                )
-            else:
-                await message.reply_text(
-                    f"<blockquote>🔄 Currently Releasing Anime (Page {page}/{total_pages}):</blockquote>\n"
-                    f"<blockquote>Numbers show uploaded/total episodes</blockquote>\n"
-                    f"<blockquote>Select an anime to view details:</blockquote>",
-                    reply_markup=InlineKeyboardMarkup(keyboard)
-                )
+            caption_text = (
+                f"<blockquote>🔄 Currently Releasing Anime (Page {page}/{total_pages}):</blockquote>\n"
+                f"<blockquote>Numbers show uploaded/total episodes</blockquote>\n"
+                f"<blockquote>Select an anime to view details:</blockquote>"
+            )
 
+            random_start_pic = random.choice(Config.START_PICS)
+
+            # Step 4: Stop animation, delete old loading msg, send final photo
+            stop_animation.set()
+            await animation_task
+
+            try:
+                await loading_msg.delete()
+            except:
+                pass
+
+            await safe_send_photo(
+                message,
+                random_start_pic,
+                caption_text,
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
 
         except Exception as e:
             logger.error(f"Error in ongoing_command: {e}")
@@ -3822,6 +4495,7 @@ class AnimeBot:
                 await message.answer(error_msg, show_alert=True)
             else:
                 await message.reply_text(error_msg)
+
     async def admin_panel(self, client: Client, callback_query: CallbackQuery):
         try:
             if callback_query.from_user.id not in Config.ADMINS:
@@ -3866,15 +4540,19 @@ class AnimeBot:
                 ])
 
             keyboard.append([
-                InlineKeyboardButton("🔙 Back", callback_data="start_menu"),
-                InlineKeyboardButton("❌ Close", callback_data="close_message")
+                InlineKeyboardButton("• ʙᴀᴄᴋ •", callback_data="start_menu"),
+                InlineKeyboardButton("• ᴄʟᴏꜱᴇ •", callback_data="close_message")
             ])
+            random_start_pic = random.choice(Config.START_PICS)
 
             await self.update_message(
                 client,
                 callback_query.message,
                 "👑 Admin Panel - Select an option:",
-                reply_markup=InlineKeyboardMarkup(keyboard)
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode=enums.ParseMode.HTML,
+                photo=random_start_pic  # Use random picture
+
             )
 
         except Exception as e:
@@ -3910,7 +4588,7 @@ class AnimeBot:
           #       InlineKeyboardButton("♻️ Reset Database", callback_data="owner_reset_db")],
 
                 [InlineKeyboardButton("🔙 Admin Panel", callback_data="admin_panel"),
-                 InlineKeyboardButton("❌ Close", callback_data="close_message")]
+                 InlineKeyboardButton("• ᴄʟᴏꜱᴇ •", callback_data="close_message")]
             ])
 
             await callback_query.message.edit_text(
@@ -3953,7 +4631,7 @@ class AnimeBot:
         # Add navigation buttons
         keyboard.append([
             InlineKeyboardButton("🔄 Refresh", callback_data="admin_settings"),
-            InlineKeyboardButton("🔙 Back", callback_data="admin_panel")
+            InlineKeyboardButton("• ʙᴀᴄᴋ •", callback_data="admin_panel")
         ])
         
         await callback_query.message.edit_text(
@@ -4342,10 +5020,10 @@ class AnimeBot:
                 nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"del_menu_{anime_id}_{page+1}"))
             keyboard.append(nav_buttons)
     
-            # 🔙 Back / Close row
+            # • ʙᴀᴄᴋ • / Close row
             keyboard.append([
-                InlineKeyboardButton("🔙 Back", callback_data=f"anime_{anime_id}"),
-                InlineKeyboardButton("❌ Close", callback_data="close_message")
+                InlineKeyboardButton("• ʙᴀᴄᴋ •", callback_data=f"anime_{anime_id}"),
+                InlineKeyboardButton("• ᴄʟᴏꜱᴇ •", callback_data="close_message")
             ])
 
     
@@ -4554,7 +5232,7 @@ class AnimeBot:
             except:
                 keyboard.append([InlineKeyboardButton(f"User {owner_id}", callback_data=f"remove_owner_{owner_id}")])
         
-        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="owner_tools")])
+        keyboard.append([InlineKeyboardButton("• ʙᴀᴄᴋ •", callback_data="owner_tools")])
         
         await self.update_message(
             client,
@@ -4578,7 +5256,7 @@ class AnimeBot:
                 message += f"- User ID: {admin_id}\n"
         
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔙 Back", callback_data="owner_tools")]
+            [InlineKeyboardButton("• ʙᴀᴄᴋ •", callback_data="owner_tools")]
         ])
         
         await self.update_message(
@@ -4863,8 +5541,8 @@ class AnimeBot:
                 ])
             
             keyboard.append([
-                InlineKeyboardButton("🔙 Back", callback_data="admin_panel"),
-                InlineKeyboardButton("❌ Close", callback_data="close_message")
+                InlineKeyboardButton("• ʙᴀᴄᴋ •", callback_data="admin_panel"),
+                InlineKeyboardButton("• ᴄʟᴏꜱᴇ •", callback_data="close_message")
             ])
             
             await self.update_message(
@@ -5069,9 +5747,24 @@ class AnimeBot:
                 await message.reply_text("❌ An anime with this title already exists!")
                 return
             
+            # Store the current insert client index before insertion
+            current_cluster_before = self.db.current_insert_client
+            
             success = await self.db.insert_anime(anime_data)
             if not success:
                 raise Exception("Failed to insert anime into database")
+            
+            # Get the actual cluster used for insertion
+            cluster_used = "Unknown cluster"
+            try:
+                # The actual cluster used is stored in current_insert_client after insertion
+                if hasattr(self.db, 'current_insert_client') and self.db.current_insert_client >= 0:
+                    cluster_used = f"Cluster {self.db.current_insert_client}"
+                else:
+                    # Fallback: if we can't determine, use the one before insertion
+                    cluster_used = f"Cluster {current_cluster_before}"
+            except Exception as e:
+                logger.warning(f"Could not determine cluster: {e}")
             
             await self.update_stats("total_anime")
             
@@ -5091,7 +5784,8 @@ class AnimeBot:
                 f"🏷️ *Genres:* {', '.join(anime_data['genres']) if anime_data['genres'] else 'None'}\n"
                 f"📅 *Year:* {anime_data['year'] or 'Not specified'}\n"
                 f"🔗 *AniList URL:* {anime_data['url'] or 'Not provided'}\n"
-                f"🆔 *Anime ID:* `{anime_data['id']}`"
+                f"🆔 *Anime ID:* `{anime_data['id']}`\n"
+                f"🗄️ *Stored in:* `{cluster_used}`"  # Added cluster information
             )
             
             keyboard = InlineKeyboardMarkup([
@@ -5121,7 +5815,6 @@ class AnimeBot:
                 "❌ *Error saving anime!*\nPlease try again or contact developer.",
                 parse_mode=enums.ParseMode.MARKDOWN
             )
-
     async def update_episode_count(self, anime_id: int, new_episode_count: int = None):
         """Update episode count for an anime, especially useful for ongoing series"""
         try:
@@ -5179,11 +5872,12 @@ class AnimeBot:
                         logger.warning(f"Error updating ongoing series in cluster: {e}")
                 
                 # Run once per day
-                await asyncio.sleep(24 * 60 * 60)
+                await asyncio.sleep(300)  # 5 minutes (in seconds)
+
                 
             except Exception as e:
                 logger.error(f"Error in auto_update_ongoing_series: {e}")
-                await asyncio.sleep(60 * 60)  # Retry after 1 hour on error
+                await asyncio.sleep(30 * 60)  # Retry after 1 hour on error
     async def edit_anime_start(self, client: Client, callback_query: CallbackQuery, anime_id: Optional[int] = None):
         if callback_query.from_user.id not in Config.ADMINS:
             await callback_query.answer("You don't have permission to access this.", show_alert=True)
@@ -5509,7 +6203,7 @@ class AnimeBot:
 
             keyboard.append([
                 InlineKeyboardButton("🔙 Admin Panel", callback_data="admin_panel"),
-                InlineKeyboardButton("❌ Close", callback_data="close_message")
+                InlineKeyboardButton("• ᴄʟᴏꜱᴇ •", callback_data="close_message")
             ])
 
             await self.update_message(
@@ -5906,7 +6600,7 @@ class AnimeBot:
                 await message.reply_text(
                     "❌ Error processing file. Please try again.",
                     reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🔙 Back", callback_data=f"admin_add_episodes_{anime_id}")]
+                        [InlineKeyboardButton("• ʙᴀᴄᴋ •", callback_data=f"admin_add_episodes_{anime_id}")]
                     ])
                 )
 
@@ -6103,7 +6797,7 @@ class AnimeBot:
             
             keyboard.append([
                 InlineKeyboardButton("🔙 Admin Panel", callback_data="admin_panel"),
-                InlineKeyboardButton("❌ Close", callback_data="close_message")
+                InlineKeyboardButton("• ᴄʟᴏꜱᴇ •", callback_data="close_message")
             ])
             
             await callback_query.message.edit_text(
@@ -6192,7 +6886,7 @@ class AnimeBot:
 
             # Back / Cancel
             keyboard.append([
-                InlineKeyboardButton("🔙 Back", callback_data="link_sequel_1"),
+                InlineKeyboardButton("• ʙᴀᴄᴋ •", callback_data="link_sequel_1"),
                 InlineKeyboardButton("❌ Cancel", callback_data="admin_panel")
             ])
 
@@ -6338,7 +7032,7 @@ class AnimeBot:
             
             keyboard.append([
                 InlineKeyboardButton("🔙 Admin Panel", callback_data="admin_panel"),
-                InlineKeyboardButton("❌ Close", callback_data="close_message")
+                InlineKeyboardButton("• ᴄʟᴏꜱᴇ •", callback_data="close_message")
             ])
             
             await self.update_message(
@@ -6526,6 +7220,10 @@ class AnimeBot:
             )
 
             # Handle message differently based on input type
+            # Pick a random start picture
+            random_start_pic = random.choice(Config.START_PICS) if getattr(Config, "START_PICS", None) else None
+
+            # Handle message differently based on input type
             if isinstance(message, CallbackQuery):
                 # Edit existing message for pagination
                 await self.update_message(
@@ -6533,12 +7231,12 @@ class AnimeBot:
                     message.message,
                     caption,
                     reply_markup=InlineKeyboardMarkup(keyboard),
-                    photo=Config.START_PIC
+                    photo=random_start_pic  # Use random picture
                 )
             else:
                 # Send new message for initial search
                 await message.reply_photo(
-                    photo=Config.START_PIC,
+                    photo=random_start_pic,  # Use random picture
                     caption=caption,
                     reply_markup=InlineKeyboardMarkup(keyboard),
                     parse_mode=enums.ParseMode.HTML
@@ -6657,31 +7355,31 @@ class AnimeBot:
                     row = []
             
             keyboard.append([
-                InlineKeyboardButton("🔙 Back", callback_data="start_menu"),
-                InlineKeyboardButton("❌ Close", callback_data="close_message")
+                InlineKeyboardButton("• ʙᴀᴄᴋ •", callback_data="start_menu"),
+                InlineKeyboardButton("• ᴄʟᴏꜱᴇ •", callback_data="close_message")
             ])
-            
+            random_start_pic = random.choice(Config.START_PICS)
+
             if isinstance(message, CallbackQuery):
                 await self.update_message(
                     client,
                     message.message,
                     "🔤 Select a letter to view anime:",
                     reply_markup=InlineKeyboardMarkup(keyboard),
-                    photo=Config.START_PIC
+                    photo=random_start_pic  # Use random picture
+
                 )
             else:
                 await message.reply_photo(
-                    photo=Config.START_PIC,
+                    photo=random_start_pic,  # Use random picture
                     caption="🔤 Select a letter to view anime:",
                     reply_markup=InlineKeyboardMarkup(keyboard))
         except Exception as e:
             logger.error(f"Show anime error: {e}")
             await message.reply_text("Error loading anime list")
-
     async def show_start_menu(self, client: Client, callback_query: CallbackQuery):
         user = callback_query.from_user
         welcome_text = Scripts.WELCOME_TEXT.format(first_name=user.first_name)
-
 
         keyboard = InlineKeyboardMarkup([
             [
@@ -6692,25 +7390,30 @@ class AnimeBot:
                 InlineKeyboardButton("⭐ ᴡᴀᴛᴄʜʟɪꜱᴛ", callback_data="view_watchlist")
             ],
             [
-                InlineKeyboardButton("❌ ᴄʟᴏꜱᴇ", callback_data="close_message")
+                InlineKeyboardButton("• ᴄʟᴏꜱᴇ •", callback_data="close_message")
             ]
         ])
 
-        
         if user.id in Config.ADMINS:
-            keyboard.inline_keyboard.append([InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")])
-        
+            keyboard.inline_keyboard.append([
+                InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")
+            ])
+
         try:
+            # pick random image if START_PICS configured
+            random_start_pic = random.choice(Config.START_PICS) if getattr(Config, "START_PICS", None) else None
+
             await self.update_message(
                 client,
                 callback_query.message,
                 welcome_text,
                 reply_markup=keyboard,
-                photo=Config.START_PIC
+                photo=random_start_pic if random_start_pic else None
             )
         except Exception as e:
             logger.error(f"Error showing start menu: {e}")
             await callback_query.answer("Error returning to start menu.")
+
     async def get_anime_title(self, anime_id: int) -> str:
         anime = await self.db.find_anime(anime_id)
         return anime.get('title', f"Anime {anime_id}")
@@ -6777,12 +7480,14 @@ class AnimeBot:
                 InlineKeyboardButton("• ʙᴀᴄᴋ •", callback_data="available_anime"),
                 InlineKeyboardButton("• ᴄʟᴏꜱᴇ •", callback_data="close_message")
             ])
-            
+            random_start_pic = random.choice(Config.START_PICS)
             await self.update_message(
                 client,
                 callback_query.message,
                 f"🌀 <b>Anime starting with '{letter}' (Page {page}/{total_pages}):</b>",
-                reply_markup=InlineKeyboardMarkup(keyboard)
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                photo=random_start_pic  # Use random picture
+
             )
         except Exception as e:
             logger.error(f"Error fetching anime by letter {letter}: {e}")
@@ -6805,15 +7510,17 @@ class AnimeBot:
             message_text = await self.format_schedule_message(schedule_data)
             
             # Delete processing message first
+            # Delete processing message first
             await processing_msg.delete()
-            
-            # Send the schedule message
-            sent_msg = await message.reply_text(
-                message_text,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True
+            random_start_pic = random.choice(Config.START_PICS)
+
+            # Send the schedule message with photo
+            sent_msg = await message.reply_photo(
+                random_start_pic,  # Use random picture
+                caption=message_text,
+                parse_mode=ParseMode.HTML
             )
-            
+
             # Auto-delete after 1 hour (3600 seconds)
             await asyncio.sleep(3600)
             await sent_msg.delete()
@@ -7059,7 +7766,7 @@ class AnimeBot:
                         "- 0 for lifetime",
                         parse_mode=ParseMode.MARKDOWN,
                         reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton("🔙 Back", callback_data="grant_premium_menu")]
+                            [InlineKeyboardButton("• ʙᴀᴄᴋ •", callback_data="grant_premium_menu")]
                         ])
                     )
                 else:
@@ -7079,7 +7786,7 @@ class AnimeBot:
                         "• `/grant 123456789 0 hpremium`",
                         parse_mode=ParseMode.MARKDOWN,
                         reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton("🔙 Back", callback_data="grant_premium_menu")]
+                            [InlineKeyboardButton("• ʙᴀᴄᴋ •", callback_data="grant_premium_menu")]
                         ])
                     )
                 else:
@@ -7148,7 +7855,7 @@ class AnimeBot:
                         "Example: `/revoke @username` or `/revoke 123456789`",
                         parse_mode=ParseMode.MARKDOWN,
                         reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton("🔙 Back", callback_data="revoke_premium_menu")]
+                            [InlineKeyboardButton("• ʙᴀᴄᴋ •", callback_data="revoke_premium_menu")]
                         ])
                     )
                 else:
@@ -7233,7 +7940,7 @@ class AnimeBot:
                     await callback_query.message.edit_text(
                         f"✅ Rate limit set to {new_value} messages/second",
                         reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton("🔙 Back to Settings", callback_data="admin_settings")]
+                            [InlineKeyboardButton("• ʙᴀᴄᴋ • to Settings", callback_data="admin_settings")]
                         ])
                     )
                 except Exception as e:
@@ -7294,6 +8001,26 @@ class AnimeBot:
                     
                 await self.show_saga_arcs(client, callback_query, anime_id, saga_id)
 
+            elif data.startswith("arc_quality_"):
+                # Format: arc_quality_{anime_id}_{saga_id}_{arc_id}
+                parts = data.split('_')
+                if len(parts) >= 5:
+                    anime_id = int(parts[2])
+                    saga_id = int(parts[3])
+                    arc_id = int(parts[4])
+                    await self.show_bulk_quality_menu(client, callback_query, anime_id, f"bulk_arc_{anime_id}_{saga_id}_{arc_id}")
+                else:
+                    await callback_query.answer("Invalid arc quality request.", show_alert=True)
+            elif data.startswith("arc_bulk_"):
+                # Format: arc_bulk_{anime_id}_{saga_id}_{arc_id}
+                parts = data.split('_')
+                if len(parts) >= 5:
+                    anime_id = int(parts[2])
+                    saga_id = int(parts[3])
+                    arc_id = int(parts[4])
+                    await self.show_arc_quality_menu(client, callback_query, anime_id, saga_id, arc_id)
+                else:
+                    await callback_query.answer("Invalid arc bulk request.", show_alert=True)          
             elif data.startswith("arc_"):
                 parts = data.split("_")
                 anime_id = int(parts[1])
@@ -7480,7 +8207,7 @@ class AnimeBot:
                 
                 # Show instructions
                 keyboard = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔙 Back", callback_data=f"anime_{anime_id}")]
+                    [InlineKeyboardButton("• ʙᴀᴄᴋ •", callback_data=f"anime_{anime_id}")]
                 ])
                 
                 anime_type = await self.get_anime_type(anime_id)
@@ -7784,15 +8511,56 @@ async def check_force_sub(client: Client, user_id: int, message: Message = None)
 
     if not is_member and message:
         force_sub_msg, keyboard = await bot.force_sub.get_force_sub_message(client)
+        random_start_pic = random.choice(Config.START_PICS)
         await client.send_photo(
             chat_id=message.chat.id,
-            photo="https://files.catbox.moe/ujbe17.jpeg",  # force start image
+            photo=random_start_pic,  # Use random picture,  # force start image
             caption=force_sub_msg,
             reply_markup=keyboard
         )
 
     return is_member
 
+
+
+async def safe_send_photo(message, photo, caption, reply_markup=None, parse_mode=enums.ParseMode.HTML):
+    """Try sending a photo, fallback to text if it fails."""
+    try:
+        return await message.reply_photo(
+            photo=photo,
+            caption=caption,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode
+        )
+    except Exception as e:
+        logger.warning(f"Falling back to text (photo send failed): {e}")
+        return await message.reply_text(
+            caption,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode,
+            disable_web_page_preview=True
+        )
+
+async def safe_edit_with_photo(client, message, photo, caption, reply_markup=None, parse_mode=enums.ParseMode.HTML):
+    """Try editing message with photo, fallback to text if it fails."""
+    try:
+        media = InputMediaPhoto(media=photo, caption=caption, parse_mode=parse_mode)
+        return await client.edit_message_media(
+            chat_id=message.chat.id,
+            message_id=message.id,
+            media=media,
+            reply_markup=reply_markup
+        )
+    except Exception as e:
+        logger.warning(f"Falling back to edit text (photo edit failed): {e}")
+        return await client.edit_message_text(
+            chat_id=message.chat.id,
+            message_id=message.id,
+            text=caption,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode,
+            disable_web_page_preview=True
+        )
 
 async def check_expiry_periodically():
     """Periodically check and revoke expired premium access"""
@@ -7881,27 +8649,32 @@ async def run_until_stopped(client: Client, stop_event: asyncio.Event):
     finally:
         if client.is_connected:
             await client.stop()
-
 async def main():
     global bot
-    bot = AnimeBot()
     
-    # Initialize everything first
-    await bot.initialize()
-    await bot.db.load_admins_and_owners()
-
-    # Start health server
-    await bot.start_health_server()
-
-    # Create the Pyrogram client
+    # Create the Pyrogram client FIRST
     app = Client(
         "AnimeFilterBot",
         api_id=Config.API_ID,
         api_hash=Config.API_HASH,
         bot_token=Config.BOT_TOKEN
     )
-    await bot.initialize(app)
+    
+    # Create AnimeBot instance and store app reference
+    bot = AnimeBot()
+    
+    # Store the app instance in bot for easy access
+    bot.app = app
+    
+    # Initialize everything with the app instance
+    await bot.initialize(app)  # Pass app here
+    await bot.db.load_admins_and_owners()
 
+    # Store bot instance in app for handler access
+    app.bot = bot
+
+    # Start health server
+    await bot.start_health_server()
 
     # Register all handlers BEFORE starting the client
     register_handlers(app)
@@ -7946,6 +8719,24 @@ def register_handlers(app: Client):
         
         # ✅ Continue normal start flow
         await bot.start(client, message)
+    @app.on_message(filters.command("test_update") & filters.user(Config.ADMINS))
+    async def test_update_channel(client, message):
+        """Test the update channel functionality"""
+        try:
+            # Access bot instance from client
+            bot_instance = client.bot
+            
+            test_message = "🔧 <b>Test Message</b>\n\nThis is a test message to verify the update channel is working correctly."
+            
+            success = await bot_instance.post_to_update_channel(test_message)
+            
+            if success:
+                await message.reply_text("✅ Test message sent successfully to update channel!")
+            else:
+                await message.reply_text("❌ Failed to send test message to update channel. Check logs for details.")
+        except Exception as e:
+            logger.error(f"Test update channel error: {e}")
+            await message.reply_text(f"❌ Error testing update channel: {e}")
     @ app.on_message(filters.command("testforcesub") & filters.user(Config.ADMINS))
     async def test_force_sub(client: Client, message: Message):
         user_id = message.from_user.id
@@ -8115,8 +8906,8 @@ def register_handlers(app: Client):
             help_text,
             parse_mode=enums.ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup([
-              #  [InlineKeyboardButton("🔙 Back to Start", callback_data="start_menu")],
-                [InlineKeyboardButton("❌ Close", callback_data="close_message")]
+              #  [InlineKeyboardButton("• ʙᴀᴄᴋ • to Start", callback_data="start_menu")],
+                [InlineKeyboardButton("• ᴄʟᴏꜱᴇ •", callback_data="close_message")]
             ])
         )
         # React to the user's message with a random emoji
