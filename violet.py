@@ -2598,6 +2598,61 @@ class AnimeBot:
             logger.warning(f"Could not extract episode number from: {combined_text}")
     
         return result
+    async def get_file_data_from_deeplink(self, deeplink: str):
+        """Extract file data from deeplink - supports multiple formats"""
+        try:
+            chat_id = None
+            message_id = None
+            
+            # Format 1: https://t.me/c/123456789/12345 (supergroup)
+            pattern1 = r't\.me/c/(\d+)/(\d+)'
+            match1 = re.search(pattern1, deeplink)
+            if match1:
+                chat_id = int(f"-100{match1.group(1)}")
+                message_id = int(match1.group(2))
+            
+            # Format 2: https://t.me/username/12345 (public channel)
+            pattern2 = r't\.me/([a-zA-Z0-9_]+)/(\d+)'
+            match2 = re.search(pattern2, deeplink)
+            if match2 and not chat_id:  # Only use if first pattern didn't match
+                username = match2.group(1)
+                message_id = int(match2.group(2))
+                # Try to resolve username to chat_id
+                try:
+                    chat = await self.app.get_chat(username)
+                    chat_id = chat.id
+                except:
+                    pass
+            
+            # Format 3: https://t.me/c/123456789/12345 (alternative format)
+            pattern3 = r't\.me/c/(-\d+)/(\d+)'
+            match3 = re.search(pattern3, deeplink)
+            if match3 and not chat_id:
+                chat_id = int(match3.group(1))
+                message_id = int(match3.group(2))
+            
+            if not chat_id or not message_id:
+                return None
+                
+            # Search for this file in all clusters
+            for db_client in self.db.anime_clients:
+                try:
+                    db = db_client[self.db.db_name]
+                    file_data = await db.files.find_one({
+                        "chat_id": chat_id,
+                        "message_id": message_id
+                    })
+                    if file_data:
+                        return file_data
+                except Exception as e:
+                    logger.warning(f"Error searching for file in cluster: {e}")
+                    continue
+                    
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error parsing deeplink {deeplink}: {e}")
+            return None
     async def send_formatted_message(client, chat_id, text, reply_markup=None):
         try:
             return await client.send_message(
@@ -2637,7 +2692,7 @@ class AnimeBot:
             try:
                 base64_string = args[1]
                 string = await decode(base64_string)
-
+        
                 if string.startswith("file_"):
                     file_id = string[5:]
                     await self.process_file_download(client, message, file_id)
@@ -2648,6 +2703,17 @@ class AnimeBot:
                         quality = parts[1]
                         anime_id = int(parts[2])
                         await self.process_file_download(client, message, f"bulk_{quality}_{anime_id}")
+                        return
+                elif string.startswith("dl_"):  # Add deeplink support
+                    deeplink_encoded = string[3:]
+                    # Decode the deeplink (it might be base64 encoded again)
+                    try:
+                        deeplink = await decode(deeplink_encoded)
+                        await self.process_deeplink_download(client, message, deeplink)
+                        return
+                    except:
+                        # If it's not base64 encoded, use it directly
+                        await self.process_deeplink_download(client, message, deeplink_encoded)
                         return
             except Exception as e:
                 logger.error(f"Error decoding start parameter: {e}")
@@ -4103,7 +4169,7 @@ class AnimeBot:
                 buttons.append([
                     InlineKeyboardButton(
                         f"▶️ {btn_text} ",
-                        callback_data=f"dl_{files[0]['_id']}"
+                        callback_data=f"dl_{files[0]['deeplink']}"
                     )
                 ])
             
