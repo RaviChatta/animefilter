@@ -2771,71 +2771,100 @@ class AnimeBot:
             logger.error(f"Deep link processing failed: {str(e)}")
             await message.reply("❌ An error occurred while processing your download")
     async def parse_deeplink(self, deeplink: str):
-        """Parse Telegram deep link to extract chat_id and message_id with channel mapping"""
+        """Parse Telegram deep link and find the actual message across all channels"""
         try:
             logger.info(f"Parsing deeplink: {deeplink}")
+            
+            # Extract the original message ID from the deep link
+            original_message_id = None
+            original_chat_id_part = None
             
             # Format 1: https://t.me/c/123456789/12345 (supergroup)
             pattern1 = r't\.me/c/(\d+)/(\d+)'
             match1 = re.search(pattern1, deeplink)
             if match1:
-                chat_id_part = match1.group(1)
-                message_id = int(match1.group(2))
-                
-                # Convert to proper channel ID format (-100 prefix)
-                chat_id = int(f"-100{chat_id_part}")
-                logger.info(f"Parsed supergroup: chat_id={chat_id}, message_id={message_id}")
-                
-                # Check if this channel ID exists in our database channels
-                database_channels = await self.db.get_database_channels()
-                if chat_id not in database_channels:
-                    logger.warning(f"Channel {chat_id} not in database channels, trying to map...")
-                    # Try to find the correct channel ID from available channels
-                    for db_channel in database_channels:
-                        try:
-                            # Check if we can access this channel
-                            await self.app.get_chat(db_channel)
-                            # If successful, use this channel instead
-                            logger.info(f"Mapping {chat_id} to accessible channel {db_channel}")
-                            return db_channel, message_id
-                        except Exception:
-                            continue
-                
-                return chat_id, message_id
+                original_chat_id_part = match1.group(1)
+                original_message_id = int(match1.group(2))
             
             # Format 2: https://t.me/username/12345 (public channel)
             pattern2 = r't\.me/([a-zA-Z0-9_]+)/(\d+)'
             match2 = re.search(pattern2, deeplink)
             if match2:
-                username = match2.group(1)
-                message_id = int(match2.group(2))
-                logger.info(f"Parsed username channel: username={username}, message_id={message_id}")
-                
-                # Try to resolve username to chat_id
-                try:
-                    chat = await self.app.get_chat(username)
-                    logger.info(f"Resolved username {username} to chat_id {chat.id}")
-                    return chat.id, message_id
-                except Exception as e:
-                    logger.warning(f"Failed to resolve username {username}: {str(e)}")
-                    # Try to find a channel that might contain this message
-                    database_channels = await self.db.get_database_channels()
-                    for channel_id in database_channels:
-                        try:
-                            # Check if message exists in this channel
-                            await self.app.get_messages(channel_id, message_id)
-                            logger.info(f"Found message {message_id} in channel {channel_id}")
-                            return channel_id, message_id
-                        except Exception:
-                            continue
-                    return username, message_id  # Fallback
+                original_message_id = int(match2.group(2))
             
-            logger.warning(f"Could not parse deeplink: {deeplink}")
+            if not original_message_id:
+                logger.warning(f"Could not extract message ID from deeplink: {deeplink}")
+                return None, None
+            
+            logger.info(f"Extracted message ID: {original_message_id}")
+            
+            # Search for this message across all database channels
+            database_channels = await self.db.get_database_channels()
+            
+            for channel_id in database_channels:
+                try:
+                    # Try to get the message from this channel
+                    message = await self.app.get_messages(channel_id, original_message_id)
+                    if message and (message.video or message.document):
+                        logger.info(f"Found message {original_message_id} in channel {channel_id}")
+                        return channel_id, original_message_id
+                except Exception as e:
+                    # Message not found in this channel, continue searching
+                    continue
+            
+            # If not found by message ID, try to find by file content
+            logger.info(f"Message {original_message_id} not found, searching by content...")
+            file_info = await self._find_file_by_original_message_id(original_message_id)
+            if file_info:
+                logger.info(f"Found file info for message {original_message_id}")
+                # Parse the correct deep link from the file info
+                if file_info.get('deeplink'):
+                    return await self.parse_deeplink(file_info['deeplink'])
+                elif file_info.get('chat_id') and file_info.get('message_id'):
+                    return file_info['chat_id'], file_info['message_id']
+            
+            logger.warning(f"Message {original_message_id} not found in any channel")
             return None, None
             
         except Exception as e:
             logger.error(f"Error parsing deeplink {deeplink}: {str(e)}")
             return None, None
+    
+    async def _find_file_by_original_message_id(self, original_message_id):
+        """Find file information by original message ID across all clusters"""
+        for db_client in getattr(self.db, "anime_clients", []):
+            try:
+                db = db_client[self.db.db_name]
+                # Look for files with the original message ID
+                file_info = await db.files.find_one({"message_id": original_message_id})
+                if file_info:
+                    return file_info
+            except Exception as e:
+                logger.warning(f"Error searching for file in cluster: {str(e)}")
+                continue
+        
+        # If not found by exact message_id, try to find by approximate match
+        # (useful if messages were reorganized)
+        for db_client in getattr(self.db, "anime_clients", []):
+            try:
+                db = db_client[self.db.db_name]
+                # Look for files with similar message IDs (within a range)
+                files = await db.files.find({
+                    "message_id": {
+                        "$gte": original_message_id - 100,
+                        "$lte": original_message_id + 100
+                    }
+                }).to_list(10)
+                
+                if files:
+                    # Return the closest match
+                    closest_file = min(files, key=lambda x: abs(x['message_id'] - original_message_id))
+                    return closest_file
+            except Exception as e:
+                logger.warning(f"Error searching for approximate file match: {str(e)}")
+                continue
+        
+        return None
     async def start(self, client: Client, message: Message):
         user_id = message.from_user.id
 
@@ -4642,11 +4671,11 @@ class AnimeBot:
     async def _process_deep_link_download(self, client, callback_query, deeplink, user_id):
         """Process download using a deep link with comprehensive error handling"""
         try:
-            # Parse the deep link
+            # Parse the deep link and find the actual message
             chat_id, message_id = await self.parse_deeplink(deeplink)
             
             if not chat_id or not message_id:
-                await callback_query.answer("❌ Invalid download link", show_alert=True)
+                await callback_query.answer("❌ File not found or link expired", show_alert=True)
                 return
             
             # Check download limits
@@ -4656,25 +4685,21 @@ class AnimeBot:
                     await callback_query.answer(limit_msg or "🔒 Download limit reached", show_alert=True)
                     return
             
-            # Check if bot has access to the channel
+            # Get the message to verify it exists
             try:
-                chat_info = await client.get_chat(chat_id)
-                logger.info(f"Bot has access to chat: {chat_info.title if hasattr(chat_info, 'title') else chat_id}")
-            except Exception as access_error:
-                logger.error(f"Bot doesn't have access to chat {chat_id}: {str(access_error)}")
+                message = await client.get_messages(chat_id, message_id)
+                if not message or (not message.video and not message.document):
+                    raise ValueError("Message not found or not a file")
+            except Exception as e:
+                logger.error(f"Message verification failed: {str(e)}")
                 
-                # Try to find the file in another channel
-                file_found = await self._try_find_file_in_other_channels(message_id)
-                if file_found:
-                    chat_id, message_id = file_found
-                    logger.info(f"Found file in alternative channel: {chat_id}/{message_id}")
+                # Try to find the file in the database and get correct info
+                file_info = await self._find_file_by_message_id(message_id)
+                if file_info and file_info.get('chat_id') and file_info.get('message_id'):
+                    chat_id, message_id = file_info['chat_id'], file_info['message_id']
+                    message = await client.get_messages(chat_id, message_id)
                 else:
-                    error_msg = (
-                        "❌ **Access Denied**\n\n"
-                        "This bot doesn't have access to the file storage channel.\n\n"
-                        "Please contact the administrator to add the bot to all database channels."
-                    )
-                    await callback_query.answer(error_msg, show_alert=True)
+                    await callback_query.answer("❌ File not found or has been deleted", show_alert=True)
                     return
             
             # Forward the message
@@ -4715,17 +4740,14 @@ class AnimeBot:
                 # Notify user
                 if callback_query.message.chat.type != "private":
                     await callback_query.answer("📤 File sent to your private chat!", show_alert=True)
-                else:
-                    await callback_query.answer("✅ Download started!", show_alert=False)
                     
             except Exception as e:
                 logger.error(f"Failed to forward message: {e}")
                 
-                # Try to find the file in database and use alternative method
+                # Fallback: try to send the file directly if we have file ID
                 file_info = await self._find_file_by_message_id(message_id)
-                if file_info and file_info.get('deeplink') and file_info['deeplink'] != deeplink:
-                    # Try with alternative deep link
-                    await self._process_deep_link_download(client, callback_query, file_info['deeplink'], user_id)
+                if file_info and file_info.get('file_id'):
+                    await self._send_file_by_id(client, user_id, file_info, callback_query)
                     return
                     
                 await callback_query.answer("❌ Failed to download file", show_alert=True)
@@ -4733,6 +4755,65 @@ class AnimeBot:
         except Exception as e:
             logger.error(f"Deep link processing failed: {e}")
             await callback_query.answer("❌ Download error occurred", show_alert=True)
+    
+    async def _send_file_by_id(self, client, user_id, file_info, callback_query):
+        """Send file using file_id as fallback"""
+        try:
+            caption = (
+                f"<b>🎬 {file_info.get('anime_title', 'Unknown')} - Episode {file_info.get('episode', '?')} "
+                f"[{(file_info.get('quality') or '').upper()}]</b>\n"
+                f"<b>💾 Size:</b> {file_info.get('file_size', 'Unknown')}"
+            )
+            
+            if file_info.get('file_type') == 'video':
+                sent_msg = await client.send_video(
+                    chat_id=user_id,
+                    video=file_info['file_id'],
+                    caption=caption,
+                    parse_mode=enums.ParseMode.HTML,
+                    protect_content=getattr(self.config, "PROTECT_CONTENT", False)
+                )
+            else:
+                sent_msg = await client.send_document(
+                    chat_id=user_id,
+                    document=file_info['file_id'],
+                    caption=caption,
+                    parse_mode=enums.ParseMode.HTML,
+                    protect_content=getattr(self.config, "PROTECT_CONTENT", False)
+                )
+            
+            # Send auto-delete warning
+            warning_msg = await client.send_message(
+                chat_id=user_id,
+                text=f"<blockquote>⚠️ This file will auto-delete in {getattr(self.config, 'DELETE_TIMER_MINUTES', 5)} minute(s).</blockquote>",
+                parse_mode=enums.ParseMode.HTML
+            )
+            
+            # Schedule deletion
+            async def delete_messages():
+                await asyncio.sleep(getattr(self.config, "DELETE_TIMER_MINUTES", 5) * 60)
+                try:
+                    await sent_msg.delete()
+                    await warning_msg.delete()
+                except Exception:
+                    pass
+            
+            asyncio.create_task(delete_messages())
+            
+            # Update stats
+            await self.db.users_collection.update_one(
+                {"user_id": user_id},
+                {"$inc": {"download_count": 1}},
+                upsert=True
+            )
+            await self.update_stats("total_downloads")
+            
+            if callback_query.message.chat.type != "private":
+                await callback_query.answer("📤 File sent to your private chat!", show_alert=True)
+                
+        except Exception as e:
+            logger.error(f"Failed to send file by ID: {e}")
+            await callback_query.answer("❌ Failed to download file", show_alert=True)
     
     async def _try_find_file_in_other_channels(self, message_id):
         """Try to find a file with the same message_id in other channels"""
@@ -4761,7 +4842,74 @@ class AnimeBot:
             except Exception:
                 continue
         return None
- 
+
+
+    async def migrate_message_references(self):
+        """Migrate message references to use correct channel-message pairs"""
+        logger.info("Starting message reference migration...")
+        
+        fixed_count = 0
+        database_channels = await self.db.get_database_channels()
+        
+        for db_client in getattr(self.db, "anime_clients", []):
+            try:
+                db = db_client[self.db.db_name]
+                # Get all files
+                files = await db.files.find({}).to_list(None)
+                
+                for file in files:
+                    if file.get('chat_id') and file.get('message_id'):
+                        # Check if this message exists in the specified channel
+                        try:
+                            message = await self.app.get_messages(file['chat_id'], file['message_id'])
+                            if message and (message.video or message.document):
+                                # Message exists, update deep link
+                                correct_deeplink = self._create_deep_link(file['chat_id'], file['message_id'])
+                                await db.files.update_one(
+                                    {"_id": file["_id"]},
+                                    {"$set": {"deeplink": correct_deeplink}}
+                                )
+                                fixed_count += 1
+                                continue
+                        except Exception:
+                            pass
+                        
+                        # Message not found in original channel, search in other channels
+                        for channel_id in database_channels:
+                            if channel_id == file['chat_id']:
+                                continue  # Skip original channel
+                                
+                            try:
+                                message = await self.app.get_messages(channel_id, file['message_id'])
+                                if message and (message.video or message.document):
+                                    # Found in different channel, update both chat_id and deep link
+                                    correct_deeplink = self._create_deep_link(channel_id, file['message_id'])
+                                    await db.files.update_one(
+                                        {"_id": file["_id"]},
+                                        {"$set": {
+                                            "chat_id": channel_id,
+                                            "deeplink": correct_deeplink
+                                        }}
+                                    )
+                                    fixed_count += 1
+                                    break
+                            except Exception:
+                                continue
+                    
+            except Exception as e:
+                logger.error(f"Migration error in cluster: {str(e)}")
+        
+        logger.info(f"Message reference migration completed: Fixed {fixed_count} files")
+
+    def _create_deep_link(self, chat_id, message_id):
+        """Create proper Telegram deep link"""
+        if str(chat_id).startswith("-100"):
+            # Supergroup/channel: t.me/c/channel_id/message_id
+            channel_part = str(chat_id).replace("-100", "")
+            return f"https://t.me/c/{channel_part}/{message_id}"
+        else:
+            # User chat or public channel: t.me/username/message_id
+            return f"https://t.me/c/{chat_id}/{message_id}"
     async def ongoing_command(self, client: Client, message: Message | CallbackQuery, page: int = 1):
         """Show paginated list of currently releasing anime"""
         try:
@@ -4879,7 +5027,47 @@ class AnimeBot:
                 await message.answer(error_msg, show_alert=True)
             else:
                 await message.reply_text(error_msg)
-
+    async def verify_files(self, client: Client, message: Message):
+        """Admin command to verify file accessibility"""
+        if message.from_user.id not in Config.ADMINS:
+            await message.reply("❌ Admin only command")
+            return
+        
+        await message.reply("🔍 Checking file accessibility...")
+        
+        inaccessible_files = 0
+        total_files = 0
+        database_channels = await self.db.get_database_channels()
+        
+        for db_client in getattr(self.db, "anime_clients", []):
+            try:
+                db = db_client[self.db.db_name]
+                files = await db.files.find({}).to_list(None)
+                total_files += len(files)
+                
+                for file in files:
+                    if file.get('chat_id') and file.get('message_id'):
+                        try:
+                            message_obj = await client.get_messages(file['chat_id'], file['message_id'])
+                            if not message_obj or (not message_obj.video and not message_obj.document):
+                                inaccessible_files += 1
+                        except Exception:
+                            inaccessible_files += 1
+                    
+            except Exception as e:
+                logger.error(f"Error checking files in cluster: {str(e)}")
+        
+        report = (
+            f"📊 **File Accessibility Report**\n\n"
+            f"• Total files: {total_files}\n"
+            f"• Inaccessible files: {inaccessible_files}\n"
+            f"• Accessibility rate: {(total_files - inaccessible_files) / total_files * 100:.1f}%\n\n"
+        )
+        
+        if inaccessible_files > 0:
+            report += "💡 Use /migrate_files to try to fix inaccessible files"
+        
+        await message.reply(report, parse_mode=enums.ParseMode.HTML)
     async def admin_panel(self, client: Client, callback_query: CallbackQuery):
         try:
             if callback_query.from_user.id not in Config.ADMINS:
