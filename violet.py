@@ -4499,7 +4499,7 @@ class AnimeBot:
             await message.reply("❌ An error occurred while processing your download")
           
     async def download_episode_file(self, client: Client, callback_query: CallbackQuery, deep_link_id: str):
-        """Handle file downloads using deep links"""
+        """Handle file downloads using deep links with robust error handling"""
         user_id = callback_query.from_user.id
         
         try:
@@ -4508,7 +4508,7 @@ class AnimeBot:
             if not deep_link:
                 await callback_query.answer("❌ File not found or link expired", show_alert=True)
                 return
-
+    
             # Check adult content restrictions
             if deep_link.get('is_adult'):
                 if self.config.RESTRICT_ADULT:
@@ -4525,41 +4525,44 @@ class AnimeBot:
                             show_alert=True
                         )
                         return
-
+    
             # Check download limits if premium mode is ON
             if self.config.PREMIUM_MODE:
                 can_download, limit_msg = await self.check_download_limit(user_id)
                 if not can_download:
                     await callback_query.answer(limit_msg, show_alert=True)
                     return
-
-            # Fetch original message from channel using stored chat_id and message_id
+    
+            # Show downloading message
+            await callback_query.answer("⬇️ Downloading...", show_alert=False)
+    
+            # Fetch original message from channel
             try:
                 msg = await client.get_messages(
                     chat_id=deep_link['chat_id'],
                     message_ids=deep_link['message_id']
                 )
-                if not msg:
-                    raise ValueError("Original message not found")
+                
+                # Check if message exists and contains a file
+                if not msg or not (hasattr(msg, 'video') or hasattr(msg, 'document')):
+                    raise ValueError("Message or file not found")
+                    
             except Exception as e:
-                logger.error(f"Error fetching original message: {str(e)}")
-                await callback_query.answer("❌ Error fetching file. Please try again.", show_alert=True)
+                logger.error(f"Error fetching message {deep_link['message_id']} from chat {deep_link['chat_id']}: {str(e)}")
+                await self.handle_missing_file(client, callback_query, deep_link)
                 return
-
+    
             # Prepare caption
             file_caption = (
                 f"<b>🎬 {deep_link.get('anime_title', 'Unknown')} - Episode {deep_link['episode']} "
                 f"[{deep_link['quality'].upper()}]</b>\n"
                 f"<b>💾 Size:</b> {deep_link['file_size']}"
             )
-
-            # Show downloading message
-            await callback_query.answer("⬇️ Downloading...", show_alert=False)
-
-            # Function to send file
+    
+            # Function to send file with better error handling
             async def send_file(chat_id):
                 try:
-                    if deep_link['file_type'] == 'video' and msg.video:
+                    if hasattr(msg, 'video') and msg.video:
                         return await client.send_video(
                             chat_id=chat_id,
                             video=msg.video.file_id,
@@ -4567,18 +4570,20 @@ class AnimeBot:
                             parse_mode=enums.ParseMode.HTML,
                             protect_content=Config.PROTECT_CONTENT
                         )
-                    else:
+                    elif hasattr(msg, 'document') and msg.document:
                         return await client.send_document(
                             chat_id=chat_id,
-                            document=msg.document.file_id if msg.document else msg.video.file_id,
+                            document=msg.document.file_id,
                             caption=file_caption,
                             parse_mode=enums.ParseMode.HTML,
                             protect_content=Config.PROTECT_CONTENT
                         )
+                    else:
+                        raise ValueError("No file found in message")
                 except Exception as e:
                     logger.error(f"Error sending file: {str(e)}")
                     raise
-
+    
             # Try sending to private chat first
             try:
                 sent_file_msg = await send_file(user_id)
@@ -4587,10 +4592,10 @@ class AnimeBot:
                     text=f"<blockquote>⚠️ This file will auto-delete in {Config.DELETE_TIMER_MINUTES} minute(s).</blockquote>",
                     parse_mode=enums.ParseMode.HTML
                 )
-
+    
                 if callback_query.message.chat.type != ChatType.PRIVATE:
                     await callback_query.answer("📤 File sent to your private chat!", show_alert=True)
-
+    
             except Exception as private_error:
                 logger.warning(f"Failed to send to PM ({str(private_error)}), trying group...")
                 try:
@@ -4602,9 +4607,9 @@ class AnimeBot:
                     )
                 except Exception as group_error:
                     logger.error(f"Failed to send to group: {str(group_error)}")
-                    await callback_query.answer("❌ Failed to send file. Please try again.", show_alert=True)
+                    await self.handle_download_error(client, callback_query, deep_link, group_error)
                     return
-
+    
             # Schedule deletion
             async def delete_messages():
                 try:
@@ -4613,20 +4618,63 @@ class AnimeBot:
                     await warning_msg.delete()
                 except Exception as e:
                     logger.warning(f"Error deleting messages: {str(e)}")
-
+    
             asyncio.create_task(delete_messages())
-
+    
             # Update stats
             await self.db.users_collection.update_one(
                 {"user_id": user_id},
                 {"$inc": {"download_count": 1}}
             )
-
+    
             await self.update_stats("total_downloads")
-
+    
         except Exception as main_error:
             logger.error(f"File download failed: {str(main_error)}")
             await callback_query.answer("❌ An error occurred while processing your download", show_alert=True)
+    
+    async def handle_missing_file(self, client: Client, callback_query: CallbackQuery, deep_link: dict):
+        """Handle cases where the file is missing from the channel"""
+        try:
+            # Mark the deep link as invalid
+            await self.db.deep_links_collection.update_one(
+                {"deep_link_id": deep_link['deep_link_id']},
+                {"$set": {"is_invalid": True, "invalid_at": datetime.now()}}
+            )
+            
+            # Notify user
+            error_msg = (
+                "❌ The requested file is no longer available.\n\n"
+                "This file may have been deleted from the storage channel. "
+                "Please try another episode or contact support if this continues."
+            )
+            
+            if callback_query.message.chat.type == ChatType.PRIVATE:
+                await callback_query.message.reply(error_msg)
+            else:
+                await callback_query.answer(error_msg, show_alert=True)
+                
+        except Exception as e:
+            logger.error(f"Error handling missing file: {e}")
+            await callback_query.answer("❌ File not available. Please try another episode.", show_alert=True)
+    
+    async def handle_download_error(self, client: Client, callback_query: CallbackQuery, deep_link: dict, error: Exception):
+        """Handle download errors gracefully"""
+        error_msg = "❌ Failed to download file. Please try again later."
+        
+        if "file not found" in str(error).lower() or "message not found" in str(error).lower():
+            error_msg = "❌ The requested file is no longer available. Please try another episode."
+            
+            # Mark as invalid if it's a missing file error
+            try:
+                await self.db.deep_links_collection.update_one(
+                    {"deep_link_id": deep_link['deep_link_id']},
+                    {"$set": {"is_invalid": True, "invalid_at": datetime.now()}}
+                )
+            except Exception as e:
+                logger.error(f"Error marking deep link as invalid: {e}")
+        
+        await callback_query.answer(error_msg, show_alert=True)
     async def ongoing_command(self, client: Client, message: Message | CallbackQuery, page: int = 1):
         """Show paginated list of currently releasing anime"""
         try:
