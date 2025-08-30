@@ -21,7 +21,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from aiohttp import ClientSession, ClientTimeout
 from pyrogram.enums import ParseMode
 from aiohttp import web
-from pyrogram import Client, filters, enums ,  __version__
+from pyrogram import Client, filters, enums
 from pyrogram.types import (
     InlineKeyboardButton, 
     InlineKeyboardMarkup, 
@@ -36,8 +36,6 @@ from premium import *
 from request import RequestSystem
 from pyrogram.handlers import MessageHandler  # Add this import
 from pyrogram.errors import FloodWait, UserIsBlocked, MessageNotModified, PeerIdInvalid
-from pyrogram.errors.exceptions.bad_request_400 import UserNotParticipant
-from pyrogram.errors import FloodWait, UserIsBlocked, InputUserDeactivated, UserNotParticipant, MediaEmpty
 from pyrogram import idle
 from pyrogram import enums
 from pyrogram.enums import ChatType , ParseMode
@@ -47,7 +45,7 @@ from settings import config
 from scripts import Scripts
 from anime_quotes import AnimeQuotes
 from force_sub import ForceSub
-from migration_manager import FileMigration
+
 
 
 MAX_FREE_TIER_SPACE = 500 * 1024 * 1024  # 500 MB cap for MongoDB Atlas free tier
@@ -240,36 +238,7 @@ class Database:
                 ]
             }
         }
-    # In your Database class
-   # In your Database class, add this method
-    async def initialize_deep_links(self):
-        """Initialize the deep links collection"""
-        try:
-            self.deep_links_collection = self.users_db.deep_links
-            # Create indexes for better performance
-            await self.deep_links_collection.create_index([("deep_link_id", 1)], unique=True)
-            await self.deep_links_collection.create_index([("anime_id", 1)])
-            await self.deep_links_collection.create_index([("episode", 1)])
-            await self.deep_links_collection.create_index([("created_at", -1)])
-            logger.info("Deep links collection initialized successfully")
-        except Exception as e:
-            logger.error(f"Error initializing deep links collection: {e}")
-            raise
-    async def get_deep_link(self, deep_link_id: str) -> Optional[dict]:
-        """Retrieve deep link information from database"""
-        try:
-            deep_link = await self.deep_links_collection.find_one({"deep_link_id": deep_link_id})
-            if deep_link:
-                # Increment access count
-                await self.deep_links_collection.update_one(
-                    {"deep_link_id": deep_link_id},
-                    {"$inc": {"access_count": 1}}
-                )
-                return deep_link
-            return None
-        except Exception as e:
-            logger.error(f"Error retrieving deep link: {e}")
-            return None
+
     async def initialize(self):
         """Initialize all database connections and collections"""
         try:
@@ -278,7 +247,6 @@ class Database:
             
             # Initialize anime clusters
             await self._initialize_anime_clusters()
-            await self.initialize_deep_links()
             self.update_channel_logs = self.users_db.update_channel_logs
             self.cluster_order = list(range(len(self.anime_clients)))
             random.shuffle(self.cluster_order)
@@ -1324,34 +1292,23 @@ class Config:
     NEW_EPISODE_TEMPLATE = (
         "📢 <b>New Episode Available!</b>\n\n"
         "🎬 <b>Anime:</b> {anime_title}\n"
-        "📺 <b>Episode:</b> {episode} [{quality}]\n"  # ✅ ADDED BRACKETS FOR QUALITIES
+        "📺 <b>Episode:</b> {episode}\n"
+        "🎯 <b>Quality:</b> {quality}\n"
         "🗣️ <b>Language:</b> {language}\n\n"
         "🔗 <a href='{url}'>View on AniList</a>\n"
-      #  "⬇️ Download: <code>/dl_{file_id}</code>"
+        "⬇️ Download: <code>/dl_{file_id}</code>"
     )
-        
+    
     ONGOING_UPDATE_TEMPLATE = (
         "🔄 <b>Ongoing Series Update</b>\n\n"
         "🎬 <b>Anime:</b> {anime_title}\n"
         "📺 <b>Latest Episode:</b> {episode}\n"
         "📊 <b>Total Uploaded:</b> {uploaded}/{total}\n"
-        "🎯 <b>Latest Quality:</b> {quality}\n"  # ✅ ADDED QUALITY INFO
         "🏷️ <b>Status:</b> {status}\n\n"
-        "👥 <b>Watchlist:</b> {watchlist_count} users\n"  # ✅ IMPROVED EMOJI
+        "🔔 Added to watchlist: {watchlist_count} users\n"
         "🔗 <a href='{url}'>View on AniList</a>"
     )
 
-    MESSAGE_EFFECT_IDS = [
-        # Latest working effect IDs (2024)
-        5104841245755180586,  # 🔥 Fire effect
-        5107584321108051014,  # 👍 Thumbs up effect
-      #  5044134455711629726,  # ❤️ Heart effect
-       # 5046509860389126642,  # 🎉 Celebration effect
-        5104858069142078462,  # 👎 Thumbs down effect
-        5046589136895476101,  # 💩 Poop effect
-        5107584321108051014
-        
-    ]
     @property
     def MULTI_EPISODE_TYPES(self):
         return [k for k, v in self.ANIME_TYPES.items() if v['has_episodes'] is True]
@@ -1685,13 +1642,13 @@ class AnimeBot:
     async def start_notification_batching(self):
         """Start the notification batching system"""
         while True:
-            await asyncio.sleep(60)  # Check 5 every minute
+            await asyncio.sleep(60)  # Check every minute
             await self.process_batched_notifications()
 
     async def process_batched_notifications(self):
         """Process batched notifications every minute"""
         while True:
-            await asyncio.sleep(30)  # Wait 4 minutes
+            await asyncio.sleep(120)  # Wait 2 minutes
             
             async with self.notification_lock:
                 # Copy current state
@@ -1712,9 +1669,9 @@ class AnimeBot:
             if anime_id in anime_to_notify:
                 # This anime is new AND has episodes - combine them!
                 anime_data = anime_to_notify[anime_id]
-                episodes_info = episodes_to_notify[anime_id]  # Now contains quality info
+                episodes = episodes_to_notify[anime_id]
                 
-                await self._notify_new_anime_with_episodes(anime_data, episodes_info)
+                await self._notify_new_anime_with_episodes(anime_data, episodes)
                 
                 # Remove from both queues to avoid duplicate notifications
                 del anime_to_notify[anime_id]
@@ -1725,33 +1682,22 @@ class AnimeBot:
             await self._notify_new_anime_immediate(anime_data)
         
         # Notify remaining episodes (for existing anime)
-        for anime_id, episodes_info in episodes_to_notify.items():
-            if episodes_info:
+        for anime_id, episodes in episodes_to_notify.items():
+            if episodes:
                 anime = await self.db.find_anime(anime_id)
                 if anime:
-                    await self._notify_batch_episodes(anime, episodes_info)
+                    await self._notify_batch_episodes(anime, episodes)
 
-    async def _notify_new_anime_with_episodes(self, anime_data, episodes_info):
-        """Notify about new anime WITH episodes and quality info per episode"""
-        # Group by episode number and collect qualities
-        episodes_dict = defaultdict(list)
-        
-        for info in episodes_info:
-            episodes_dict[info['episode']].append(info['quality'])
-        
-        # Format episode-quality pairs
-        episode_sections = []
-        for episode, qualities in sorted(episodes_dict.items()):
-            # Remove duplicates and sort qualities by resolution
-            unique_qualities = sorted(set(qualities), key=lambda x: self._parse_quality(x), reverse=True)
-            quality_list = ", ".join([q.upper() for q in unique_qualities])
-            episode_sections.append(f"   • Episode {episode} [{quality_list}]")
+    async def _notify_new_anime_with_episodes(self, anime_data, episodes):
+        """Notify about new anime WITH episodes included"""
+        episodes.sort()
+        episode_range = self._format_episode_range(episodes)
         
         message = (
             "🎉 <b>New Anime Added with Episodes!</b>\n\n"
             f"🎬 <b>Title:</b> {html.escape(anime_data.get('title', 'Unknown Anime'))}\n"
             f"📺 <b>Type:</b> {anime_data.get('type', 'TV')}\n"
-            f"📊 <b>Episodes Available:</b>\n" + "\n".join(episode_sections) + "\n\n"
+            f"📊 <b>Episodes Available:</b> {episode_range}\n"
             f"⭐ <b>Rating:</b> {anime_data.get('score', 0)/10 if anime_data.get('score') else 'N/A'}/10\n"
             f"🏷️ <b>Genres:</b> {', '.join(anime_data.get('genres', []))}\n\n"
             f"🔗 <a href='{anime_data.get('url', '')}'>View on AniList</a>\n"
@@ -1760,35 +1706,21 @@ class AnimeBot:
         
         cover_url = anime_data.get("cover_url", Config.COVER_PIC)
         await self.post_to_update_channel(message, cover_url)
-    async def _notify_batch_episodes(self, anime, episodes_info):
-        """Notify about batched episodes with quality information per episode"""
-        # Group by episode number and collect qualities
-        episodes_dict = defaultdict(list)
-        
-        for info in episodes_info:
-            episodes_dict[info['episode']].append(info['quality'])
-        
-        # Format episode-quality pairs
-        episode_sections = []
-        for episode, qualities in sorted(episodes_dict.items()):
-            # Remove duplicates and sort qualities by resolution
-            unique_qualities = sorted(set(qualities), key=lambda x: self._parse_quality(x), reverse=True)
-            quality_list = ", ".join([q.upper() for q in unique_qualities])
-            episode_sections.append(f"   • Episode {episode} [{quality_list}]")
+    async def _notify_batch_episodes(self, anime, episodes):
+        """Notify about batched episodes"""
+        episodes.sort()
+        episode_range = self._format_episode_range(episodes)
         
         message = (
             "📦 <b>New Episodes Added!</b>\n\n"
             f"🎬 <b>Anime:</b> {html.escape(anime.get('title', 'Unknown Anime'))}\n"
-            f"📺 <b>Episodes:</b>\n" + "\n".join(episode_sections) + "\n\n"
-            f"📊 <b>Total Files:</b> {len(episodes_info)}\n\n"
+            f"📺 <b>Episodes:</b> {episode_range}\n"
+            f"📊 <b>Total:</b> {len(episodes)} episodes\n\n"
             f"🔗 <a href='{anime.get('url', '')}'>View on AniList</a>\n"
             f"🔍 Search: <code>{html.escape(anime.get('title', ''))}</code>"
         )
         
-        # ✅ Add cover image like in _notify_new_anime_with_episodes
-        cover_url = anime.get("cover_url", Config.COVER_PIC)
-        await self.post_to_update_channel(message, cover_url)
-
+        await self.post_to_update_channel(message)
 
     def _format_episode_range(self, episodes: list) -> str:
         """Format episode list into proper ranges (e.g., 1-25)"""
@@ -1820,17 +1752,7 @@ class AnimeBot:
             ranges.append(f"{start}-{end}")
         
         return ", ".join(ranges)
-    def _parse_quality(self, quality_str):
-        """Helper to parse quality strings for sorting (360p -> 360, 720p -> 720 etc.)"""
-        if not quality_str or not isinstance(quality_str, str):
-            return 0
-        
-        try:
-            # Extract first sequence of digits and convert to int
-            digits = ''.join(c for c in quality_str if c.isdigit())
-            return int(digits) if digits else 0
-        except (ValueError, TypeError):
-            return 0
+
     async def queue_new_anime(self, anime_data):
         """Queue new anime for batched notification"""
         async with self.notification_lock:
@@ -1838,14 +1760,9 @@ class AnimeBot:
             self.pending_anime_notifications[anime_data["id"]] = anime_data
 
     async def queue_new_episode(self, file_data):
-        """Queue new episode for batched notification with quality info"""
+        """Queue new episode for batched notification"""
         async with self.notification_lock:
-            # Store episode number AND quality
-            episode_info = {
-                'episode': file_data["episode"],
-                'quality': file_data.get("quality", "Unknown")
-            }
-            self.pending_episode_notifications[file_data["anime_id"]].append(episode_info)
+            self.pending_episode_notifications[file_data["anime_id"]].append(file_data["episode"])
     async def _notify_new_anime_immediate(self, anime_data):
         """Notify about new anime addition"""
         logger.info(f"NOTIFY: Starting new anime notification for {anime_data.get('title', 'Unknown')}")
@@ -1882,8 +1799,9 @@ class AnimeBot:
                 
         except Exception as e:
             logger.error(f"NOTIFY: Error notifying new anime: {e}")
+
     async def notify_new_episode(self, file_data: dict):
-        """Notify about new episode addition - groups same episode with different qualities"""
+        """Notify about new episode addition"""
         logger.info(f"NOTIFY: Starting new episode notification for anime {file_data['anime_id']}, episode {file_data['episode']}")
         
         if not Config.POST_NEW_EPISODES:
@@ -1903,23 +1821,7 @@ class AnimeBot:
             is_ongoing = anime.get("status") == "RELEASING"
             logger.info(f"NOTIFY: Is ongoing series: {is_ongoing}")
             
-            # ✅ CHECK IF SAME EPISODE ALREADY EXISTS WITH DIFFERENT QUALITY
-            existing_files = await self.db.find_files(file_data["anime_id"], file_data["episode"])
-            existing_qualities = {f.get("quality", "Unknown").lower() for f in existing_files if f.get("quality")}
-            new_quality = file_data.get("quality", "Unknown").lower()
-            
-            # If this quality already exists for this episode, skip notification
-            if new_quality in existing_qualities:
-                logger.info(f"NOTIFY: Quality {new_quality} already exists for episode {file_data['episode']}, skipping notification")
-                return
-                
-            # ✅ GET ALL QUALITIES FOR THIS EPISODE (including the new one)
-            all_qualities = list(existing_qualities)
-            all_qualities.append(new_quality)
-            all_qualities = sorted(set(all_qualities), key=lambda x: self._parse_quality(x), reverse=True)
-            quality_text = ", ".join([q.upper() for q in all_qualities])
-            
-            # FIX: Handle None values
+            # FIX: Handle None values for quality and language
             quality = file_data.get("quality", "Unknown")
             if quality is None:
                 quality = "Unknown"
@@ -1928,14 +1830,14 @@ class AnimeBot:
             if language is None:
                 language = "Unknown"
             
-            # ✅ MODIFIED MESSAGE TO SHOW ALL QUALITIES
-            message = (
-                "📢 <b>New Episode Available!</b>\n\n"
-                f"🎬 <b>Anime:</b> {html.escape(anime.get('title', 'Unknown Anime'))}\n"
-                f"📺 <b>Episode:</b> {file_data['episode']} [{quality_text}]\n"
-                f"🗣️ <b>Language:</b> {language.upper()}\n\n"
-                f"🔗 <a href='{anime.get('url', '')}'>View on AniList</a>\n"
-                f"⬇️ Download: <code>/dl_{file_data.get('file_id', '')}</code>"
+            # Format episode message
+            message = Config.NEW_EPISODE_TEMPLATE.format(
+                anime_title=html.escape(anime.get("title", "Unknown Anime")),
+                episode=file_data["episode"],
+                quality=quality.upper(),
+                language=language.upper(),
+                url=anime.get("url", ""),
+                file_id=file_data.get("file_id", "")
             )
             
             logger.info(f"NOTIFY: Formatted episode message for {anime.get('title', 'Unknown')}")
@@ -1957,291 +1859,33 @@ class AnimeBot:
                 
         except Exception as e:
             logger.error(f"NOTIFY: Error notifying new episode: {e}")
-    async def send_immediate_ongoing_update(self, anime_id: int, new_episode: int):
-        """Send immediate ongoing update when new episode is added"""
+    async def notify_ongoing_update(self, anime: dict, latest_episode: int):
+        """Notify about ongoing series update"""
         try:
-            # Get anime details
-            anime = await self.db.find_anime(anime_id)
-            if not anime or anime.get("status") != "RELEASING":
-                return False
-            
             # Get watchlist count
-            watchlist_count = await self.db.get_watchlist_count(anime_id)
+            watchlist_count = await self.db.get_watchlist_count(anime["id"])
             
             # Get total uploaded episodes
-            total_uploaded = await self.db.count_episodes(anime_id, count_unique=True)
+            total_uploaded = await self.db.count_episodes(anime["id"], count_unique=True)
             
-            # Get latest episode quality
-            latest_quality = "Unknown"
-            latest_files = await self.db.find_files(anime_id, new_episode)
-            if latest_files:
-                qualities = [f.get("quality", "Unknown") for f in latest_files if f.get("quality")]
-                if qualities:
-                    latest_quality = max(qualities, key=lambda x: self._parse_quality(x))
-            
-            # Format immediate update message
-            message = (
-                "🆕 <b>New Episode Added to Ongoing Series!</b>\n\n"
-                f"🎬 <b>Anime:</b> {html.escape(anime.get('title', 'Unknown Anime'))}\n"
-                f"📺 <b>Latest Episode:</b> {new_episode} [{latest_quality.upper()}]\n"
-                f"📊 <b>Progress:</b> {total_uploaded}/{anime.get('episodes', '?')} episodes\n"
-                f"🏷️ <b>Status:</b> {anime.get('status', 'Unknown').replace('_', ' ').title()}\n\n"
-                f"👥 <b>Watchlist:</b> {watchlist_count} users\n"
-                f"🔗 <a href='{anime.get('url', '')}'>View on AniList</a>\n\n"
-                f"💫 Use <code>/watchlist</code> to track your favorite ongoing series!"
+            # Format ongoing update message
+            message = Config.ONGOING_UPDATE_TEMPLATE.format(
+                anime_title=anime.get("title", "Unknown Anime"),
+                episode=latest_episode,
+                uploaded=total_uploaded,
+                total=anime.get("episodes", "?"),
+                status=anime.get("status", "Unknown").replace("_", " ").title(),
+                watchlist_count=watchlist_count,
+                url=anime.get("url", "")
             )
             
             # Post to update channel with anime cover
             cover_url = anime.get("cover_url", Config.COVER_PIC)
-            success = await self.post_to_update_channel(message, cover_url)
+            await self.post_to_update_channel(message, cover_url)
             
-            if success:
-                logger.info(f"Sent immediate ongoing update for {anime.get('title')} EP{new_episode}")
-                return True
-                
         except Exception as e:
-            logger.error(f"Error sending immediate ongoing update: {e}")
-        
-        return False
+            logger.error(f"Error notifying ongoing update: {e}")
     # Fix the session management in AnimeBot class
-    # In your AnimeBot class
-    async def run_migration(self):
-        """Run the file migration"""
-        # Initialize deep links collection
-        if not hasattr(self.db, 'deep_links_collection'):
-            self.db.deep_links_collection = self.db.users_db.deep_links
-        
-        migration = FileMigration(self.db, self)
-        
-        # Check current status before migration
-        status_before = await migration.check_migration_status()
-        logger.info(f"Migration status before: {status_before}")
-        
-        # Start migration
-        result = await migration.migrate_all_files_to_deep_links(batch_size=200)
-        
-        # Check status after migration
-        status_after = await migration.check_migration_status()
-        logger.info(f"Migration status after: {status_after}")
-        
-        return {
-            "status_before": status_before,
-            "status_after": status_after,
-            "migration_result": result
-        }
-
-    async def migrate_command(self, client: Client, message: Message):
-        """Admin command to trigger migration"""
-        if message.from_user.id not in Config.ADMINS:
-            await message.reply("❌ Admin only command")
-            return
-        
-        processing_msg = await message.reply("🔄 Starting file migration...")
-        
-        try:
-            result = await self.run_migration()
-            
-            # Format report
-            status_before = result['status_before']
-            status_after = result['status_after']
-            migration_result = result['migration_result']
-            
-            # Calculate progress
-            newly_migrated = status_after['migrated_files'] - status_before['migrated_files']
-            
-            result_text = (
-                f"✅ Migration Complete!\n\n"
-                f"• Total Files: {status_after['total_files']}\n"
-                f"• Previously Migrated: {status_before['migrated_files']}\n"
-                f"• Newly Migrated: {newly_migrated}\n"
-                f"• Total Migrated: {status_after['migrated_files']}\n"
-                f"• Still Not Migrated: {status_after['not_migrated_files']}\n"
-                f"• Errors: {len(migration_result['errors'])}\n\n"
-            )
-            
-            # Add cluster details
-            for cluster in status_after['clusters']:
-                if 'error' in cluster:
-                    result_text += f"Cluster {cluster['cluster_index']}: ERROR - {cluster['error']}\n"
-                else:
-                    progress = "✅" if cluster['not_migrated_files'] == 0 else "🔄"
-                    result_text += f"{progress} Cluster {cluster['cluster_index']}: {cluster['migrated_files']}/{cluster['total_files']} ({cluster['completion_percentage']:.1f}%)\n"
-            
-            # Show first few errors if any
-            if migration_result['errors']:
-                result_text += f"\nFirst 3 errors:\n"
-                for error in migration_result['errors'][:3]:
-                    result_text += f"• {error}\n"
-                if len(migration_result['errors']) > 3:
-                    result_text += f"• ... and {len(migration_result['errors']) - 3} more errors\n"
-            
-            await processing_msg.edit_text(result_text)
-            
-            # Log full errors to console
-            if migration_result['errors']:
-                logger.error("Migration errors:")
-                for error in migration_result['errors']:
-                    logger.error(f"  {error}")
-            
-        except Exception as e:
-            logger.error(f"Migration failed: {e}")
-            await processing_msg.edit_text(f"❌ Migration failed: {str(e)}")
-    async def migration_status_command(self, client: Client, message: Message):
-        """Check current migration status"""
-        """Check current migration progress"""
-        if message.from_user.id not in Config.ADMINS:
-            await message.reply("❌ Admin only command")
-            return
-        
-        processing_msg = await message.reply("🔄 Checking migration progress...")
-        
-        try:
-            migration = FileMigration(self.db, self)
-            progress = await migration.get_migration_progress()
-            
-            result_text = (
-                f"📊 Migration Progress\n\n"
-                f"• Total Files: {progress['overall']['total_files']}\n"
-                f"• Migrated Files: {progress['overall']['migrated_files']}\n"
-                f"• Not Migrated: {progress['overall']['not_migrated_files']}\n"
-                f"• Completion: {(progress['overall']['migrated_files'] / progress['overall']['total_files'] * 100):.1f}%\n\n"
-            )
-            
-            # Add cluster details
-            for cluster in progress['clusters']:
-                if 'error' in cluster:
-                    result_text += f"❌ Cluster {cluster['cluster_index']}: ERROR\n"
-                else:
-                    status_icon = "✅" if cluster['not_migrated_files'] == 0 else "🔄"
-                    result_text += f"{status_icon} Cluster {cluster['cluster_index']}: {cluster['migrated_files']}/{cluster['total_files']} ({cluster['completion_percentage']:.1f}%)\n"
-            
-            await processing_msg.edit_text(result_text)
-            
-        except Exception as e:
-            logger.error(f"Progress check failed: {e}")
-            await processing_msg.edit_text(f"❌ Progress check failed: {str(e)}")
-    async def verify_deep_links_command(self, client: Client, message: Message):
-        """Verify that deep links are working correctly"""
-        if message.from_user.id not in Config.ADMINS:
-            await message.reply("❌ Admin only command")
-            return
-        
-        processing_msg = await message.reply("🔍 Verifying deep links...")
-        
-        try:
-            # Make sure deep links collection is initialized
-            if not hasattr(self.db, 'deep_links_collection'):
-                await self.db.initialize_deep_links()
-            
-            test_results = []
-            successful_tests = 0
-            
-            for cluster_idx, db_client in enumerate(self.db.anime_clients):
-                try:
-                    db = db_client[self.db.db_name]
-                    
-                    # Get a random file from this cluster
-                    random_file = await db.files.aggregate([
-                        {"$match": {"deep_link_id": {"$exists": True}}},
-                        {"$sample": {"size": 1}}
-                    ]).to_list(1)
-                    
-                    if random_file:
-                        file_data = random_file[0]
-                        deep_link_id = file_data.get('deep_link_id')
-                        
-                        if not deep_link_id:
-                            test_results.append(f"⚠️ Cluster {cluster_idx}: File has no deep_link_id")
-                            continue
-                        
-                        # Verify the deep link exists in the database
-                        deep_link = await self.db.deep_links_collection.find_one({"deep_link_id": deep_link_id})
-                        
-                        if deep_link:
-                            test_results.append(f"✅ Cluster {cluster_idx}: Deep link {deep_link_id[:8]}... works")
-                            successful_tests += 1
-                        else:
-                            test_results.append(f"❌ Cluster {cluster_idx}: Deep link {deep_link_id[:8]}... not found in database")
-                    else:
-                        test_results.append(f"⚠️ Cluster {cluster_idx}: No files with deep links found")
-                        
-                except Exception as e:
-                    test_results.append(f"❌ Cluster {cluster_idx}: Error - {str(e)}")
-            
-            # Format results
-            result_text = "🔍 Deep Link Verification Results:\n\n"
-            for result in test_results:
-                result_text += f"• {result}\n"
-            
-            result_text += f"\n📊 Summary: {successful_tests}/{len(self.db.anime_clients)} clusters successful"
-            
-            if successful_tests == len(self.db.anime_clients):
-                result_text += " 🎉\n\nAll deep links are working correctly!"
-            else:
-                result_text += "\n\nSome issues were found with the deep links."
-            
-            await processing_msg.edit_text(result_text)
-            
-        except Exception as e:
-            logger.error(f"Verification failed: {e}")
-            await processing_msg.edit_text(f"❌ Verification failed: {str(e)}")
-
-    async def check_database_command(self, client: Client, message: Message):
-        """Check database status and collections"""
-        if message.from_user.id not in Config.ADMINS:
-            await message.reply("❌ Admin only command")
-            return
-        
-        processing_msg = await message.reply("🔍 Checking database status...")
-        
-        try:
-            result_text = "📊 Database Status:\n\n"
-            
-            # Check if deep_links_collection exists
-            if hasattr(self.db, 'deep_links_collection'):
-                result_text += "✅ Deep links collection: Initialized\n"
-                
-                # Count documents in deep links collection
-                try:
-                    deep_links_count = await self.db.deep_links_collection.estimated_document_count()
-                    result_text += f"• Deep links count: {deep_links_count}\n"
-                except Exception as e:
-                    result_text += f"• Deep links count: Error - {str(e)}\n"
-            else:
-                result_text += "❌ Deep links collection: Not initialized\n"
-            
-            # Check files in each cluster
-            result_text += "\n📁 Files by cluster:\n"
-            total_files = 0
-            total_with_deep_links = 0
-            
-            for cluster_idx, db_client in enumerate(self.db.anime_clients):
-                try:
-                    db = db_client[self.db.db_name]
-                    cluster_files = await db.files.estimated_document_count()
-                    files_with_deep_links = await db.files.count_documents({"deep_link_id": {"$exists": True}})
-                    
-                    result_text += f"• Cluster {cluster_idx}: {files_with_deep_links}/{cluster_files} with deep links\n"
-                    
-                    total_files += cluster_files
-                    total_with_deep_links += files_with_deep_links
-                except Exception as e:
-                    result_text += f"• Cluster {cluster_idx}: Error - {str(e)}\n"
-            
-            result_text += f"\n📈 Total: {total_with_deep_links}/{total_files} files with deep links"
-            
-            if total_with_deep_links == total_files:
-                result_text += " 🎉 (100% migrated!)"
-            else:
-                result_text += f" ({ (total_with_deep_links / total_files * 100) if total_files > 0 else 0 :.1f}%)"
-            
-            await processing_msg.edit_text(result_text)
-            
-        except Exception as e:
-            logger.error(f"Database check failed: {e}")
-            await processing_msg.edit_text(f"❌ Database check failed: {str(e)}")
-
-    # Add the handler
     def get_user_session(self, user_id: int, message_id: int = None):
         """Get user session data with automatic cleanup"""
         now = datetime.now()
@@ -2824,7 +2468,7 @@ class AnimeBot:
                 force_sub_msg, keyboard = await self.force_sub.get_force_sub_message(client)
                 await client.send_photo(
                     chat_id=message.chat.id,
-                    photo=self.force_sub.force_sub_image,
+                    photo=self.force_sub.force_sub_image,  # configurable image
                     caption=force_sub_msg,
                     reply_markup=keyboard
                 )
@@ -2836,21 +2480,22 @@ class AnimeBot:
 
         if len(args) > 1:
             try:
-                # Handle deep links (file_{deep_link_id})
-                if args[1].startswith("file_"):
-                    deep_link_id = args[1][5:]  # Remove "file_" prefix
-                    await self.process_file_download(client, message, deep_link_id)
+                base64_string = args[1]
+                string = await decode(base64_string)
+
+                if string.startswith("file_"):
+                    file_id = string[5:]
+                    await self.process_file_download(client, message, file_id)
                     return
-                # Handle bulk download links (bulk_{quality}_{anime_id})
-                elif args[1].startswith("bulk_"):
-                    parts = args[1].split('_')
+                elif string.startswith("bulk_"):
+                    parts = string.split('_')
                     if len(parts) >= 3:
                         quality = parts[1]
                         anime_id = int(parts[2])
-                        await self.show_bulk_quality_menu(client, message, anime_id, args[1])
+                        await self.process_file_download(client, message, f"bulk_{quality}_{anime_id}")
                         return
             except Exception as e:
-                logger.error(f"Error processing start parameter: {e}")
+                logger.error(f"Error decoding start parameter: {e}")
 
         user = message.from_user
 
@@ -2917,37 +2562,19 @@ class AnimeBot:
             ])
         random_start_pic = random.choice(Config.START_PICS)
 
-        
         try:
-            # Only use message effects in private chats
-            if message.chat.type == enums.ChatType.PRIVATE:
                 await message.reply_photo(
-                    photo=random_start_pic,
-                    caption=welcome_text,
-                    reply_markup=keyboard,
-                    parse_mode=enums.ParseMode.HTML,
-                    message_effect_id=random.choice(Config.MESSAGE_EFFECT_IDS)
-                )
-            else:
-                await message.reply_photo(
-                    photo=random_start_pic,
-                    caption=welcome_text,
-                    reply_markup=keyboard,
-                    parse_mode=enums.ParseMode.HTML
-                )
+                photo=random_start_pic,
+                caption=welcome_text,
+                reply_markup=keyboard,
+                parse_mode=enums.ParseMode.HTML  # Make sure this is set!
+
                 
+            )
+
         except Exception as e:
-            logger.warning(f"Error with message effect, retrying without: {e}")
-            try:
-                await message.reply_photo(
-                    photo=random_start_pic,
-                    caption=welcome_text,
-                    reply_markup=keyboard,
-                    parse_mode=enums.ParseMode.HTML
-                )
-            except Exception as e2:
-                logger.error(f"Error sending start message: {e2}")
-                await message.reply_text("⚠️ Error starting bot. Please try again.")
+            logger.error(f"Error sending start message: {e}")
+            await message.reply_text("⚠️ Error starting bot. Please try again.")
 
     async def search_anime(self, client: Client, message: Message):
         try:
@@ -4272,7 +3899,6 @@ class AnimeBot:
         # Continue with the download process
         await self._execute_bulk_download(client, callback_query, anime_id, quality, all_files)
     async def show_episode_options(self, client: Client, callback_query: CallbackQuery, anime_id: int, episode: int):
-        """Show episode options with deep links"""
         user_id = callback_query.from_user.id
         if user_id not in self.user_sessions or 'current_anime' not in self.user_sessions[user_id]:
             await callback_query.answer("Session expired. Please search again.", show_alert=True)
@@ -4289,75 +3915,38 @@ class AnimeBot:
             
             self.user_sessions[user_id]['current_episode'] = episode
             
-            # Group files by quality and language
             quality_groups = {}
             for file in episode_files:
-                # Use deep_link_id instead of file _id
-                if 'deep_link_id' not in file:
-                    # If file doesn't have deep_link_id, create one (for backward compatibility)
-                    deep_link_id = await self.db.create_deep_link(file)
-                    if deep_link_id:
-                        # Update the file with the new deep_link_id
-                        for db_client in self.db.anime_clients:
-                            try:
-                                db = db_client[self.db.db_name]
-                                await db.files.update_one(
-                                    {"_id": file["_id"]},
-                                    {"$set": {"deep_link_id": deep_link_id}}
-                                )
-                                file['deep_link_id'] = deep_link_id
-                                break
-                            except Exception:
-                                continue
-                
                 quality = file['quality'].lower()
-                language = file.get('language', '').lower()
-                key = f"{quality}_{language}"
-                
-                if key not in quality_groups:
-                    quality_groups[key] = []
-                quality_groups[key].append(file)
+                if quality not in quality_groups:
+                    quality_groups[quality] = []
+                quality_groups[quality].append(file)
             
             buttons = []
-            for key, files in quality_groups.items():
-                quality, language = key.split('_')
-                lang_text = f" [{language.upper()}]" if language and language != 'unknown' else ""
+            for quality, files in quality_groups.items():
+                lang_text = f" [{files[0].get('language', '').upper()}]" if files[0].get('language') else ""
                 btn_text = f"{quality.upper()}{lang_text} ({files[0]['file_size']})"
                 
-                # Use deep_link_id instead of file _id
                 buttons.append([
                     InlineKeyboardButton(
                         f"▶️ {btn_text} ",
-                        callback_data=f"dl_{files[0]['deep_link_id']}"  # CHANGED: Using deep_link_id
+                        callback_data=f"dl_{files[0]['_id']}"
                     )
                 ])
             
-            # Navigation buttons
             nav_buttons = []
             if episode > 1:
                 nav_buttons.append(InlineKeyboardButton("• ⬅️ ᴘʀᴇᴠ ᴇᴘ •", callback_data=f"ep_{anime_id}_{episode-1}"))
-            
-            # Check if there's a next episode
-            next_episode = episode + 1
-            next_episode_files = await self.db.find_files(anime_id, next_episode)
-            if next_episode_files:
-                nav_buttons.append(InlineKeyboardButton("• ➡️ ɴᴇxᴛ ᴇᴘ •", callback_data=f"ep_{anime_id}_{next_episode}"))
-            
+            if episode < (anime.get('episodes', episode + 1)):
+                nav_buttons.append(InlineKeyboardButton("• ➡️ ɴᴇxᴛ ᴇᴘ •", callback_data=f"ep_{anime_id}_{episode+1}"))
             if nav_buttons:
                 buttons.append(nav_buttons)
             
-            # Add bulk download option if multiple episodes available
-            total_episodes = await self.db.count_episodes(anime_id, count_unique=True)
-            if total_episodes > 1:
-                buttons.append([
-                    InlineKeyboardButton(
-                        "📥 Download All Episodes",
-                        callback_data=f"bulk_{anime_id}"
-                    )
-                ])
-            
             buttons.append([
-                InlineKeyboardButton("• 🔙 ʙᴀᴄᴋ ᴛᴏ ᴇᴘ •", callback_data=f"episodes_{anime_id}_{self.user_sessions[user_id].get('episodes_page', 1)}"),
+                InlineKeyboardButton(
+                    "• 🔙 ʙᴀᴄᴋ ᴛᴏ ᴇᴘ •", 
+                    callback_data=f"episodes_{anime_id}_{self.user_sessions[user_id].get('episodes_page', 1)}"
+                ),
                 InlineKeyboardButton("• ᴄʟᴏꜱᴇ •", callback_data="close_message")
             ])
             
@@ -4370,20 +3959,31 @@ class AnimeBot:
             )
         except Exception as e:
             logger.error(f"Error fetching episode files: {e}")
-            await callback_query.answer("⚠️ Error fetching files.", show_alert=True)
-    async def process_file_download(self, client: Client, message: Message, deep_link_id: str):
-        """Handle file downloads from direct deep links (from /start commands)"""
+            await callback_query.answer("⚠️ Error fetching files.", show_alert=True)   
+    async def process_file_download(self, client: Client, message: Message, file_id: str):
+        """Handle file downloads with proper restrictions and error handling"""
         user_id = message.from_user.id
         
         try:
-            # Get deep link information from database
-            deep_link = await self.db.get_deep_link(deep_link_id)
-            if not deep_link:
+            # Search for the file across all clusters
+            file_info = None
+            for db_client in self.db.anime_clients:
+                try:
+                    db = db_client[self.db.db_name]
+                    found = await db.files.find_one({"_id": ObjectId(file_id)})
+                    if found:
+                        file_info = found
+                        break
+                except Exception as e:
+                    logger.warning(f"Error searching for file in cluster {db_client}: {str(e)}")
+                    continue
+
+            if not file_info:
                 await message.reply("❌ File not found or link expired")
                 return
 
             # Check adult content restrictions
-            if deep_link.get('is_adult'):
+            if file_info.get('is_adult'):
                 if self.config.RESTRICT_ADULT:
                     if not await self.premium.check_access(user_id, 'hpremium'):
                         await message.reply(
@@ -4398,7 +3998,7 @@ class AnimeBot:
                             disable_web_page_preview=True
                         )
                         return
-
+            
             # Check download limits if premium mode is ON
             if self.config.PREMIUM_MODE:
                 can_download, limit_msg = await self.check_download_limit(user_id)
@@ -4406,11 +4006,11 @@ class AnimeBot:
                     await message.reply(limit_msg, disable_web_page_preview=True)
                     return
 
-            # Fetch original message from channel
+            # Fetch original message
             try:
                 msg = await client.get_messages(
-                    chat_id=deep_link['chat_id'],
-                    message_ids=deep_link['message_id']
+                    chat_id=file_info['chat_id'],
+                    message_ids=file_info['message_id']
                 )
                 if not msg:
                     raise ValueError("Original message not found")
@@ -4421,15 +4021,15 @@ class AnimeBot:
 
             # Prepare caption
             file_caption = (
-                f"<b>🎬 {deep_link.get('anime_title', 'Unknown')} - Episode {deep_link['episode']} "
-                f"[{deep_link['quality'].upper()}]</b>\n"
-                f"<b>💾 Size:</b> {deep_link['file_size']}"
+                f"<b>🎬 {file_info.get('anime_title', 'Unknown')} - Episode {file_info['episode']} "
+                f"[{file_info['quality'].upper()}]</b>\n"
+                f"<b>💾 Size:</b> {file_info['file_size']}"
             )
 
             # Function to send file
             async def send_file(chat_id):
                 try:
-                    if deep_link['file_type'] == 'video' and msg.video:
+                    if file_info['file_type'] == 'video':
                         return await client.send_video(
                             chat_id=chat_id,
                             video=msg.video.file_id,
@@ -4440,7 +4040,7 @@ class AnimeBot:
                     else:
                         return await client.send_document(
                             chat_id=chat_id,
-                            document=msg.document.file_id if msg.document else msg.video.file_id,
+                            document=msg.document.file_id,
                             caption=file_caption,
                             parse_mode=enums.ParseMode.HTML,
                             protect_content=Config.PROTECT_CONTENT
@@ -4454,7 +4054,11 @@ class AnimeBot:
                 sent_file_msg = await send_file(user_id)
                 warning_msg = await client.send_message(
                     chat_id=user_id,
-                    text=f"<blockquote>⚠️ This file will auto-delete in {Config.DELETE_TIMER_MINUTES} minute(s).</blockquote>",
+                    text = f"""
+                        <blockquote>
+                        ⚠️ This file will auto-delete in {Config.DELETE_TIMER_MINUTES} minute(s).
+                        </blockquote>
+                        """,
                     parse_mode=enums.ParseMode.HTML
                 )
 
@@ -4467,7 +4071,7 @@ class AnimeBot:
                     sent_file_msg = await send_file(message.chat.id)
                     warning_msg = await client.send_message(
                         chat_id=message.chat.id,
-                        text=f"<blockquote>⚠️ This file will auto-delete in {Config.DELETE_TIMER_MINUTES} minute(s).</blockquote>",
+                        text=f"⚠️ This file will auto-delete in {Config.DELETE_TIMER_MINUTES} minute(s).",
                         parse_mode=enums.ParseMode.HTML
                     )
                 except Exception as group_error:
@@ -4497,211 +4101,183 @@ class AnimeBot:
         except Exception as main_error:
             logger.error(f"File download failed: {str(main_error)}")
             await message.reply("❌ An error occurred while processing your download")
+
           
-    async def download_episode_file(self, client: Client, callback_query: CallbackQuery, deep_link_id: str):
-        """Handle file downloads using deep links with robust error handling"""
+    async def download_episode_file(self, client: Client, callback_query: CallbackQuery, file_id: str):
+        """Handle file downloads from callback queries"""
         user_id = callback_query.from_user.id
-        
+        # Force sub check
+        if not await check_force_sub(client, user_id, callback_query.message):
+            return
         try:
-            # Get deep link information from database
-            deep_link = await self.db.get_deep_link(deep_link_id)
-            if not deep_link:
-                await callback_query.answer("❌ File not found or link expired", show_alert=True)
+            # Handle bulk download requests
+            if file_id.startswith("bulk_"):
+                parts = file_id.split('_')
+                if len(parts) >= 3:
+                    quality = parts[1]
+                    anime_id = int(parts[2])
+                    anime = await self.db.find_anime(anime_id)
+                    if not anime:
+                        await callback_query.answer("❌ Anime not found!", show_alert=True)
+                        return
+
+                    if anime.get('is_releasing'):
+                        await callback_query.answer(
+                            "⚠️ This anime is still releasing. Episodes may be added later.",
+                            show_alert=True
+                        )
+                    return await self.process_bulk_download(client, callback_query, anime_id, quality)
+                else:
+                    await callback_query.answer("⚠️ Invalid bulk download link", show_alert=True)
+                    return
+
+            # Search for file across all clusters
+            file_info = None
+            for db_client in self.db.anime_clients:
+                try:
+                    db = db_client[self.db.db_name]
+                    found = await db.files.find_one({"_id": ObjectId(file_id)})
+                    if found:
+                        file_info = found
+                        break
+                except Exception as e:
+                    logger.warning(f"Error searching in cluster {db_client}: {str(e)}")
+                    continue
+
+            if not file_info:
+                await callback_query.answer("❌ File not found", show_alert=True)
                 return
-    
-            # Check adult content restrictions
-            if deep_link.get('is_adult'):
+
+            # Check restrictions
+            if file_info.get('is_adult'):
                 if self.config.RESTRICT_ADULT:
                     if not await self.premium.check_access(user_id, 'hpremium'):
                         await callback_query.answer(
-                            "🔞 Adult content requires H-Premium subscription!",
+                            "🔞 Adult content requires H-Premium!",
                             show_alert=True
                         )
                         return
                 elif self.config.PREMIUM_MODE:
                     if not await self.premium.check_access(user_id, 'premium'):
                         await callback_query.answer(
-                            "🔒 Content requires premium subscription!",
+                            "🔒 Premium subscription required!",
                             show_alert=True
                         )
                         return
-    
-            # Check download limits if premium mode is ON
+
             if self.config.PREMIUM_MODE:
                 can_download, limit_msg = await self.check_download_limit(user_id)
                 if not can_download:
                     await callback_query.answer(limit_msg, show_alert=True)
                     return
-    
-            # Show downloading message
-            await callback_query.answer("⬇️ Downloading...", show_alert=False)
-    
-            # Fetch original message from channel
+
+            # Fetch and send file
             try:
                 msg = await client.get_messages(
-                    chat_id=deep_link['chat_id'],
-                    message_ids=deep_link['message_id']
+                    chat_id=file_info['chat_id'],
+                    message_ids=file_info['message_id']
                 )
-                
-                # Check if message exists and contains a file
-                if not msg or not (hasattr(msg, 'video') or hasattr(msg, 'document')):
-                    raise ValueError("Message or file not found")
-                    
-            except Exception as e:
-                logger.error(f"Error fetching message {deep_link['message_id']} from chat {deep_link['chat_id']}: {str(e)}")
-                await self.handle_missing_file(client, callback_query, deep_link)
-                return
-    
-            # Prepare caption
-            file_caption = (
-                f"<b>🎬 {deep_link.get('anime_title', 'Unknown')} - Episode {deep_link['episode']} "
-                f"[{deep_link['quality'].upper()}]</b>\n"
-                f"<b>💾 Size:</b> {deep_link['file_size']}"
-            )
-    
-            # Function to send file with better error handling
-            async def send_file(chat_id):
+                if not msg:
+                    raise ValueError("Original message missing")
+
+                caption = (
+                    f"<b>🎬 {file_info.get('anime_title', 'Unknown')} - Episode {file_info['episode']} "
+                    f"[{file_info['quality'].upper()}]</b>\n"
+                    f"<b>💾 Size:</b> {file_info['file_size']}"
+                )
+
+                # Try private chat first
                 try:
-                    if hasattr(msg, 'video') and msg.video:
-                        return await client.send_video(
-                            chat_id=chat_id,
+                    if file_info['file_type'] == 'video':
+                        sent_msg = await client.send_video(
+                            chat_id=user_id,
                             video=msg.video.file_id,
-                            caption=file_caption,
-                            parse_mode=enums.ParseMode.HTML,
-                            protect_content=Config.PROTECT_CONTENT
-                        )
-                    elif hasattr(msg, 'document') and msg.document:
-                        return await client.send_document(
-                            chat_id=chat_id,
-                            document=msg.document.file_id,
-                            caption=file_caption,
+                            caption=caption,
                             parse_mode=enums.ParseMode.HTML,
                             protect_content=Config.PROTECT_CONTENT
                         )
                     else:
-                        raise ValueError("No file found in message")
-                except Exception as e:
-                    logger.error(f"Error sending file: {str(e)}")
-                    raise
-    
-            # Try sending to private chat first
-            try:
-                sent_file_msg = await send_file(user_id)
-                warning_msg = await client.send_message(
-                    chat_id=user_id,
-                    text=f"<blockquote>⚠️ This file will auto-delete in {Config.DELETE_TIMER_MINUTES} minute(s).</blockquote>",
-                    parse_mode=enums.ParseMode.HTML
-                )
-    
-                if callback_query.message.chat.type != ChatType.PRIVATE:
-                    await callback_query.answer("📤 File sent to your private chat!", show_alert=True)
-    
-            except Exception as private_error:
-                logger.warning(f"Failed to send to PM ({str(private_error)}), trying group...")
-                try:
-                    sent_file_msg = await send_file(callback_query.message.chat.id)
+                        sent_msg = await client.send_document(
+                            chat_id=user_id,
+                            document=msg.document.file_id,
+                            caption=caption,
+                            parse_mode=enums.ParseMode.HTML,
+                            protect_content=Config.PROTECT_CONTENT
+                        )
+
                     warning_msg = await client.send_message(
-                        chat_id=callback_query.message.chat.id,
-                        text=f"<blockquote>⚠️ This file will auto-delete in {Config.DELETE_TIMER_MINUTES} minute(s).</blockquote>",
+                        chat_id=user_id,
+                        text = f"""
+                        <blockquote>
+                        ⚠️ This file will auto-delete in {Config.DELETE_TIMER_MINUTES} minute(s).
+                        </blockquote>
+                        """,
                         parse_mode=enums.ParseMode.HTML
                     )
-                except Exception as group_error:
-                    logger.error(f"Failed to send to group: {str(group_error)}")
-                    await self.handle_download_error(client, callback_query, deep_link, group_error)
-                    return
-    
-            # Schedule deletion
-            async def delete_messages():
-                try:
+
+                    if callback_query.message.chat.type != ChatType.PRIVATE:
+                        await callback_query.answer("📤 Sent to your private chat!", show_alert=True)
+
+                except Exception as private_error:
+                    logger.warning(f"PM send failed ({str(private_error)}), trying group...")
+                    if file_info['file_type'] == 'video':
+                        sent_msg = await client.send_video(
+                            chat_id=callback_query.message.chat.id,
+                            video=msg.video.file_id,
+                            caption=caption,
+                            parse_mode=enums.ParseMode.HTML
+                        )
+                    else:
+                        sent_msg = await client.send_document(
+                            chat_id=callback_query.message.chat.id,
+                            document=msg.document.file_id,
+                            caption=caption,
+                            parse_mode=enums.ParseMode.HTML
+                        )
+
+                    warning_msg = await client.send_message(
+                        chat_id=callback_query.message.chat.id,
+                        text = f"""
+                        <blockquote>
+                        ⚠️ This file will auto-delete in {Config.DELETE_TIMER_MINUTES} minute(s).
+                        </blockquote>
+                        """,
+                        parse_mode=enums.ParseMode.HTML
+                    )
+
+                # Schedule deletion
+                async def delete_messages():
                     await asyncio.sleep(Config.DELETE_TIMER_MINUTES * 60)
-                    await sent_file_msg.delete()
-                    await warning_msg.delete()
-                except Exception as e:
-                    logger.warning(f"Error deleting messages: {str(e)}")
-    
-            asyncio.create_task(delete_messages())
-    
-            # Update stats
-            await self.db.users_collection.update_one(
-                {"user_id": user_id},
-                {"$inc": {"download_count": 1}}
-            )
-    
-            await self.update_stats("total_downloads")
-    
-        except Exception as main_error:
-            logger.error(f"File download failed: {str(main_error)}")
-            await callback_query.answer("❌ An error occurred while processing your download", show_alert=True)
-    
-    async def handle_missing_file(self, client: Client, callback_query: CallbackQuery, deep_link: dict):
-        """Handle cases where the file is missing from the channel"""
-        try:
-            # Mark the deep link as invalid
-            await self.db.deep_links_collection.update_one(
-                {"deep_link_id": deep_link['deep_link_id']},
-                {"$set": {"is_invalid": True, "invalid_at": datetime.now()}}
-            )
-            
-            # Notify user
-            error_msg = (
-                "❌ The requested file is no longer available.\n\n"
-                "This file may have been deleted from the storage channel. "
-                "Please try another episode or contact support if this continues."
-            )
-            
-            if callback_query.message.chat.type == ChatType.PRIVATE:
-                await callback_query.message.reply(error_msg)
-            else:
-                await callback_query.answer(error_msg, show_alert=True)
-                
-        except Exception as e:
-            logger.error(f"Error handling missing file: {e}")
-            await callback_query.answer("❌ File not available. Please try another episode.", show_alert=True)
-    
-    async def handle_download_error(self, client: Client, callback_query: CallbackQuery, deep_link: dict, error: Exception):
-        """Handle download errors gracefully"""
-        error_msg = "❌ Failed to download file. Please try again later."
-        
-        if "file not found" in str(error).lower() or "message not found" in str(error).lower():
-            error_msg = "❌ The requested file is no longer available. Please try another episode."
-            
-            # Mark as invalid if it's a missing file error
-            try:
-                await self.db.deep_links_collection.update_one(
-                    {"deep_link_id": deep_link['deep_link_id']},
-                    {"$set": {"is_invalid": True, "invalid_at": datetime.now()}}
+                    try:
+                        await sent_msg.delete()
+                        await warning_msg.delete()
+                    except:
+                        pass
+
+                asyncio.create_task(delete_messages())
+
+                # Update stats
+                await self.db.users_collection.update_one(
+                    {"user_id": user_id},
+                    {"$inc": {"download_count": 1}}
                 )
+
+                await self.update_stats("total_downloads")
+
             except Exception as e:
-                logger.error(f"Error marking deep link as invalid: {e}")
-        
-        await callback_query.answer(error_msg, show_alert=True)
-    async def ongoing_command(self, client: Client, message: Message | CallbackQuery, page: int = 1):
+                logger.error(f"File send failed: {str(e)}")
+                await callback_query.answer("❌ Failed to send file", show_alert=True)
+
+        except Exception as main_error:
+            logger.critical(f"Download failed: {str(main_error)}")
+            await callback_query.answer("❌ Download error occurred", show_alert=True)
+
+    async def ongoing_command(self, client: Client, message: Message, page: int = 1):
         """Show paginated list of currently releasing anime"""
         try:
-            # Step 1: Send initial loading message (text only)
-            if isinstance(message, CallbackQuery):
-                loading_msg = await message.message.edit_text("⏳ Loading")
-            else:
-                loading_msg = await message.reply_text("⏳ Loading")
-
-            # Step 2: Start background animation (dots)
-            stop_animation = asyncio.Event()
-
-            async def animate_loading():
-                dots = ["⏳ Loading", "⏳ Loading.", "⏳ Loading..", "⏳ Loading..."]
-                i = 0
-                while not stop_animation.is_set():
-                    try:
-                        await loading_msg.edit_text(dots[i % len(dots)])
-                    except Exception:
-                        pass
-                    i += 1
-                    await asyncio.sleep(0.5)
-
-            animation_task = asyncio.create_task(animate_loading())
-
-            # Step 3: Collect from DBs (heavy work)
-            ITEMS_PER_PAGE = 10
+            ITEMS_PER_PAGE = 10  # Number of items per page
+            
+            # Search across all clusters for anime with status "RELEASING"
             releasing_anime = []
             for db_client in self.db.anime_clients:
                 try:
@@ -4716,26 +4292,25 @@ class AnimeBot:
                     continue
 
             # Deduplicate
-            seen_ids, unique_anime = set(), []
+            seen_ids = set()
+            unique_anime = []
             for anime in releasing_anime:
                 if anime["id"] not in seen_ids:
                     seen_ids.add(anime["id"])
                     unique_anime.append(anime)
 
             if not unique_anime:
-                stop_animation.set()
-                await animation_task
-                await loading_msg.edit_text("ℹ️ No currently releasing anime found.")
+                await message.reply_text("ℹ️ No currently releasing anime found.")
                 return
 
-            # Pagination
+            # Calculate pagination
             total_pages = (len(unique_anime) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE
-            page = max(1, min(page, total_pages))
+            page = max(1, min(page, total_pages))  # Clamp page to valid range
             start_idx = (page - 1) * ITEMS_PER_PAGE
             end_idx = start_idx + ITEMS_PER_PAGE
             page_anime = unique_anime[start_idx:end_idx]
 
-            # Build keyboard
+            # Create keyboard buttons
             keyboard = []
             for anime in page_anime:
                 try:
@@ -4745,14 +4320,20 @@ class AnimeBot:
                     total_uploaded = 0
 
                 btn_text = f"{anime['title']} ({total_uploaded}/{anime.get('episodes', '?')})"
-                keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"anime_{anime['id']}")])
+                keyboard.append([
+                    InlineKeyboardButton(btn_text, callback_data=f"anime_{anime['id']}")
+                ])
 
+            # Pagination controls
             pagination_buttons = []
             if page > 1:
                 pagination_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"ongoing_page_{page-1}"))
+            
             pagination_buttons.append(InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
+            
             if page < total_pages:
                 pagination_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"ongoing_page_{page+1}"))
+
             if pagination_buttons:
                 keyboard.append(pagination_buttons)
 
@@ -4761,6 +4342,7 @@ class AnimeBot:
                 InlineKeyboardButton("• ᴄʟᴏꜱᴇ •", callback_data="close_message")
             ])
 
+            # ✅ Caption text for both photo + fallback
             caption_text = (
                 f"<blockquote>🔄 Currently Releasing Anime (Page {page}/{total_pages}):</blockquote>\n"
                 f"<blockquote>Numbers show uploaded/total episodes</blockquote>\n"
@@ -4769,21 +4351,22 @@ class AnimeBot:
 
             random_start_pic = random.choice(Config.START_PICS)
 
-            # Step 4: Stop animation, delete old loading msg, send final photo
-            stop_animation.set()
-            await animation_task
-
-            try:
-                await loading_msg.delete()
-            except:
-                pass
-
-            await safe_send_photo(
-                message,
-                random_start_pic,
-                caption_text,
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
+            # ✅ Use safe send/edit with fallback
+            if isinstance(message, CallbackQuery):
+                await safe_edit_with_photo(
+                    client,
+                    message.message,
+                    random_start_pic,
+                    caption_text,
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+            else:
+                await safe_send_photo(
+                    message,
+                    random_start_pic,
+                    caption_text,
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
 
         except Exception as e:
             logger.error(f"Error in ongoing_command: {e}")
@@ -4792,6 +4375,7 @@ class AnimeBot:
                 await message.answer(error_msg, show_alert=True)
             else:
                 await message.reply_text(error_msg)
+
 
     async def admin_panel(self, client: Client, callback_query: CallbackQuery):
         try:
@@ -8959,15 +8543,10 @@ async def main():
     
     # Create AnimeBot instance and store app reference
     bot = AnimeBot()
-  
+    
     # Store the app instance in bot for easy access
     bot.app = app
-    #setup_migration_handlers(app, bot, Config)
-    app.add_handler(MessageHandler(bot.migrate_command, filters.command("migrate")))
-    app.add_handler(MessageHandler(bot.check_database_command, filters.command("dbstatus")))
-    app.add_handler(MessageHandler(bot.verify_deep_links_command, filters.command("verifylinks")))
-    app.add_handler(MessageHandler(bot.migration_status_command, filters.command("migrationstatus")))
-
+    
     # Initialize everything with the app instance
     await bot.initialize(app)  # Pass app here
     await bot.db.load_admins_and_owners()
