@@ -9427,7 +9427,46 @@ def register_handlers(app: Client):
         await bot.handle_callback_query(client, callback_query)
  
     # Inline query handler
-
+    @app.on_message(filters.command("addbot") & filters.user(Config.OWNERS))
+    async def add_bot_to_channels(client: Client, message: Message):
+        """Add current bot to all database channels"""
+        try:
+            db_channels = await bot.db.get_database_channels()
+            added = 0
+            failed = 0
+            
+            for channel_id in db_channels:
+                try:
+                    # Add bot as admin to channel
+                    await client.promote_chat_member(
+                        chat_id=channel_id,
+                        user_id=(await client.get_me()).id,
+                        privileges=ChatPrivileges(
+                            can_post_messages=True,
+                            can_edit_messages=True,
+                            can_delete_messages=True,
+                            can_manage_video_chats=True,
+                            can_restrict_members=True,
+                            can_promote_members=False,
+                            can_change_info=True,
+                            can_invite_users=True,
+                            can_pin_messages=True
+                        )
+                    )
+                    added += 1
+                    logger.info(f"Added bot to channel: {channel_id}")
+                except Exception as e:
+                    logger.error(f"Failed to add bot to channel {channel_id}: {e}")
+                    failed += 1
+            
+            await message.reply_text(
+                f"✅ Bot added to {added} channels\n"
+                f"❌ Failed: {failed} channels\n\n"
+                f"Deep links should work now!"
+            )
+            
+        except Exception as e:
+            await message.reply_text(f"❌ Error: {str(e)}")
     @app.on_inline_query()
     async def inline_query(client: Client, inline_query):
         try:
