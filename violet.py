@@ -2669,6 +2669,108 @@ class AnimeBot:
                 text=html.unescape(re.sub('<[^<]+?>', '', text)),
                 reply_markup=reply_markup
             )
+
+    async def process_deeplink_download(self, client: Client, message: Message, deeplink: str):
+        """Process downloads using Telegram deep links"""
+        user_id = message.from_user.id
+        
+        try:
+            # Parse the deep link to extract chat_id and message_id
+            chat_id, message_id = await self.parse_deeplink(deeplink)
+            
+            if not chat_id or not message_id:
+                await message.reply("❌ Invalid download link")
+                return
+                
+            # Forward the message to the user
+            try:
+                forwarded_msg = await client.forward_messages(
+                    chat_id=user_id,
+                    from_chat_id=chat_id,
+                    message_ids=message_id
+                )
+                
+                # Send auto-delete warning
+                warning_msg = await client.send_message(
+                    chat_id=user_id,
+                    text=f"⚠️ This file will auto-delete in {Config.DELETE_TIMER_MINUTES} minute(s).",
+                    parse_mode=enums.ParseMode.HTML
+                )
+                
+                # Schedule deletion
+                asyncio.create_task(
+                    self.delete_message_after_delay(
+                        client,
+                        user_id,
+                        forwarded_msg.id,
+                        Config.DELETE_TIMER_MINUTES * 60
+                    )
+                )
+                asyncio.create_task(
+                    self.delete_message_after_delay(
+                        client,
+                        user_id,
+                        warning_msg.id,
+                        Config.DELETE_TIMER_MINUTES * 60
+                    )
+                )
+                
+                if message.chat.type != ChatType.PRIVATE:
+                    await message.reply("📤 File sent to your private chat!")
+                    
+                # Update stats
+                await self.update_stats("total_downloads")
+                await self.db.users_collection.update_one(
+                    {"user_id": user_id},
+                    {"$inc": {"download_count": 1}}
+                )
+                
+            except Exception as e:
+                logger.error(f"Failed to forward message: {str(e)}")
+                await message.reply("❌ Failed to download file. Please try again.")
+                
+        except Exception as e:
+            logger.error(f"Deep link processing failed: {str(e)}")
+            await message.reply("❌ Invalid download link")
+
+    async def parse_deeplink(self, deeplink: str):
+        """Parse Telegram deep link to extract chat_id and message_id"""
+        try:
+            # Format 1: https://t.me/c/123456789/12345 (supergroup)
+            pattern1 = r't\.me/c/(\d+)/(\d+)'
+            match1 = re.search(pattern1, deeplink)
+            if match1:
+                chat_id = int(f"-100{match1.group(1)}")
+                message_id = int(match1.group(2))
+                return chat_id, message_id
+            
+            # Format 2: https://t.me/username/12345 (public channel)
+            pattern2 = r't\.me/([a-zA-Z0-9_]+)/(\d+)'
+            match2 = re.search(pattern2, deeplink)
+            if match2:
+                username = match2.group(1)
+                message_id = int(match2.group(2))
+                # Resolve username to chat_id
+                try:
+                    chat = await self.app.get_chat(username)
+                    return chat.id, message_id
+                except Exception as e:
+                    logger.error(f"Failed to resolve username {username}: {str(e)}")
+                    return None, None
+            
+            # Format 3: https://t.me/c/123456789/12345 (alternative format)
+            pattern3 = r't\.me/c/(-\d+)/(\d+)'
+            match3 = re.search(pattern3, deeplink)
+            if match3:
+                chat_id = int(match3.group(1))
+                message_id = int(match3.group(2))
+                return chat_id, message_id
+                
+            return None, None
+            
+        except Exception as e:
+            logger.error(f"Error parsing deeplink: {str(e)}")
+            return None, None
     async def start(self, client: Client, message: Message):
         user_id = message.from_user.id
 
@@ -2692,8 +2794,12 @@ class AnimeBot:
             try:
                 base64_string = args[1]
                 string = await decode(base64_string)
-        
-                if string.startswith("file_"):
+                
+                if string.startswith("http") or "t.me" in string:
+                    # It's a deep link
+                    await self.process_deeplink_download(client, message, string)
+                    return
+                elif string.startswith("file_"):
                     file_id = string[5:]
                     await self.process_file_download(client, message, file_id)
                     return
